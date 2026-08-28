@@ -1,0 +1,20 @@
+[package]
+name = "alarm_at_game_end"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23"
+chrono = { version = "0.4", features = ["serde"] }
+dirs-next = "2"
+eframe = { version = "0.36", features = ["glow"] }
+notify-rust = "4"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rodio = "0.22.2"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Graphics_Dwm"] }
