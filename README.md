@@ -4,30 +4,6 @@ A small Windows desktop app for alarms that can wait until your game is over.
 
 Set an alarm, choose whether it should delay while a tracked game is active, and get a desktop notification plus an in-app popup when it fires. The app includes a default alarm sound and can use a custom sound file.
 
-## Run
-
-```powershell
-cargo run
-```
-
-Useful development commands:
-
-```powershell
-cargo fmt
-cargo test
-cargo build --release
-```
-
-## Share
-
-Build a Windows release package:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1
-```
-
-The package is written to `dist\Alarm at Game End-windows-x64.zip`.
-
 ## Features
 
 - Schedule and manage multiple pending alarms with short labels.
