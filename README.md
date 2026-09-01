@@ -14,10 +14,16 @@ Set an alarm, choose whether it should delay while a tracked game is active, and
 - Pair with the Discord bridge to receive remote alarm requests.
 - Manage Discord pairing, owner-created invites, and allowed users from a dedicated Discord page. Polling starts automatically after pairing, temporary pairing codes are hidden once inactive, and new pending invites are surfaced on the Discord page.
 
-## Game Detection
+## Game Detection 
 
 League of Legends is detected from the local lockfile, with a manual override available in the app. The lockfile password is read only while the app is running and is not stored.
 
 Counter-Strike 2 uses Game State Integration through a local listener. Install the GSI config from the app so CS2 can report active map state.
 
 If game detection is unavailable when an alarm is due, the alarm fires instead of waiting indefinitely.
+
+
+## Plans
+
+Have discord Bot integration - in progress
+Add more games.
