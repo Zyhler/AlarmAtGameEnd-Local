@@ -11,7 +11,8 @@ Set an alarm, choose whether it should delay while a tracked game is active, and
 - Delay alarms while League of Legends or Counter-Strike 2 is in an active game.
 - Use desktop notifications, a persistent in-app popup, and bundled or custom alarm sounds.
 - Save settings, pending alarms, and recent logs between launches.
-- Pair with the Discord bridge to receive remote alarm requests.
+
+In-progress:
 - Manage Discord pairing, owner-created invites, and allowed users from a dedicated Discord page. Polling starts automatically after pairing, temporary pairing codes are hidden once inactive, and new pending invites are surfaced on the Discord page.
 
 ## Game Detection 
