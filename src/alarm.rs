@@ -20,7 +20,7 @@ pub type AlarmId = u64;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Alarm {
-    pub reminder: String,
+    pub label: String,
     pub scheduled_for: DateTime<Local>,
     pub delay_for_games: bool,
     pub sound_path: Option<PathBuf>,
@@ -28,21 +28,21 @@ pub struct Alarm {
 
 impl Alarm {
     pub fn new(
-        reminder: impl Into<String>,
+        label: impl Into<String>,
         scheduled_for: DateTime<Local>,
         delay_for_games: bool,
     ) -> Self {
-        Self::with_sound(reminder, scheduled_for, delay_for_games, None)
+        Self::with_sound(label, scheduled_for, delay_for_games, None)
     }
 
     pub fn with_sound(
-        reminder: impl Into<String>,
+        label: impl Into<String>,
         scheduled_for: DateTime<Local>,
         delay_for_games: bool,
         sound_path: Option<PathBuf>,
     ) -> Self {
         Self {
-            reminder: reminder.into(),
+            label: label.into(),
             scheduled_for,
             delay_for_games,
             sound_path,
@@ -72,7 +72,7 @@ impl AlarmStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AlarmEvent {
     pub id: AlarmId,
-    pub reminder: String,
+    pub label: String,
     pub scheduled_for: DateTime<Local>,
     pub fired_at: DateTime<Local>,
     pub delayed_by_game: bool,
@@ -92,14 +92,14 @@ pub struct AlarmSnapshot {
     pub status: AlarmStatus,
     pub alarms: Vec<PendingAlarmSnapshot>,
     pub fired_at: Option<DateTime<Local>>,
-    pub last_fired_reminder: Option<String>,
+    pub last_fired_label: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AlarmEngine {
     alarms: Vec<PendingAlarm>,
     fired_at: Option<DateTime<Local>>,
-    last_fired_reminder: Option<String>,
+    last_fired_label: Option<String>,
     next_alarm_id: AlarmId,
 }
 
@@ -116,7 +116,7 @@ impl Default for AlarmEngine {
         Self {
             alarms: Vec::new(),
             fired_at: None,
-            last_fired_reminder: None,
+            last_fired_label: None,
             next_alarm_id: 1,
         }
     }
@@ -159,14 +159,14 @@ impl AlarmEngine {
         });
         self.sort_alarms();
         self.fired_at = None;
-        self.last_fired_reminder = None;
+        self.last_fired_label = None;
         id
     }
 
     pub fn cancel(&mut self) {
         self.alarms.clear();
         self.fired_at = None;
-        self.last_fired_reminder = None;
+        self.last_fired_label = None;
     }
 
     pub fn cancel_alarm(&mut self, id: AlarmId) -> bool {
@@ -217,7 +217,7 @@ impl AlarmEngine {
                 })
                 .collect(),
             fired_at: self.fired_at,
-            last_fired_reminder: self.last_fired_reminder.clone(),
+            last_fired_label: self.last_fired_label.clone(),
         }
     }
 
@@ -248,11 +248,11 @@ impl AlarmEngine {
 
     fn fire(&mut self, fired_at: DateTime<Local>, pending_alarm: PendingAlarm) -> AlarmEvent {
         self.fired_at = Some(fired_at);
-        self.last_fired_reminder = Some(pending_alarm.alarm.reminder.clone());
+        self.last_fired_label = Some(pending_alarm.alarm.label.clone());
 
         AlarmEvent {
             id: pending_alarm.id,
-            reminder: pending_alarm.alarm.reminder,
+            label: pending_alarm.alarm.label,
             scheduled_for: pending_alarm.alarm.scheduled_for,
             fired_at,
             delayed_by_game: pending_alarm.delayed_by_game,
@@ -305,8 +305,10 @@ pub fn normalize_alarm_time_text(input: &str) -> Result<String, AlarmTimeError> 
 fn parse_alarm_time(input: &str) -> Result<NaiveTime, AlarmTimeError> {
     let trimmed = input.trim();
 
-    if trimmed.len() == 4 && trimmed.chars().all(|value| value.is_ascii_digit()) {
-        let (hour, minute) = trimmed.split_at(2);
+    if (trimmed.len() == 3 || trimmed.len() == 4)
+        && trimmed.chars().all(|value| value.is_ascii_digit())
+    {
+        let (hour, minute) = trimmed.split_at(trimmed.len() - 2);
         return parse_alarm_time_parts(hour, minute);
     }
 
@@ -371,7 +373,7 @@ mod tests {
             .pop()
             .expect("alarm should fire");
 
-        assert_eq!(event.reminder, "Laundry");
+        assert_eq!(event.label, "Laundry");
         assert!(!event.delayed_by_game);
         assert_eq!(engine.snapshot().status, AlarmStatus::Fired);
     }
@@ -391,7 +393,7 @@ mod tests {
             .expect("alarm should fire when the game ends");
 
         assert!(event.delayed_by_game);
-        assert_eq!(event.reminder, "Laundry");
+        assert_eq!(event.label, "Laundry");
     }
 
     #[test]
@@ -405,7 +407,7 @@ mod tests {
             .pop()
             .expect("alarm should fire");
 
-        assert_eq!(event.reminder, "Laundry");
+        assert_eq!(event.label, "Laundry");
         assert!(!event.delayed_by_game);
     }
 
@@ -457,7 +459,7 @@ mod tests {
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.alarms.len(), 1);
         assert_eq!(snapshot.alarms[0].id, keep_id);
-        assert_eq!(snapshot.alarms[0].alarm.reminder, "Keep");
+        assert_eq!(snapshot.alarms[0].alarm.label, "Keep");
     }
 
     #[test]
@@ -488,8 +490,8 @@ mod tests {
         let events = engine.tick(now, GameActivity::Inactive);
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].reminder, "One");
-        assert_eq!(events[1].reminder, "Two");
+        assert_eq!(events[0].label, "One");
+        assert_eq!(events[1].label, "Two");
         assert!(engine.snapshot().alarms.is_empty());
     }
 
@@ -534,7 +536,19 @@ mod tests {
     }
 
     #[test]
+    fn next_alarm_time_accepts_three_digits() {
+        let now = Local::now();
+        let scheduled = next_alarm_time("125", now).expect("valid alarm time");
+
+        assert_eq!(scheduled.format("%H.%M").to_string(), "01.25");
+    }
+
+    #[test]
     fn alarm_time_normalizes_to_dot_separator() {
+        assert_eq!(
+            normalize_alarm_time_text("125").expect("valid alarm time"),
+            "01.25"
+        );
         assert_eq!(
             normalize_alarm_time_text("1554").expect("valid alarm time"),
             "15.54"
@@ -557,8 +571,8 @@ mod tests {
     }
 
     #[test]
-    fn alarm_time_rejects_short_digit_input() {
-        let error = normalize_alarm_time_text("955").expect_err("format should be rejected");
+    fn alarm_time_rejects_too_short_digit_input() {
+        let error = normalize_alarm_time_text("55").expect_err("format should be rejected");
 
         assert_eq!(error, AlarmTimeError::InvalidFormat);
     }

@@ -24,7 +24,7 @@ pub enum MonitorEvent {
     Snapshot(MonitorSnapshot),
     AlarmFired {
         id: AlarmId,
-        reminder: String,
+        label: String,
         delayed_by_game: bool,
         fired_at: DateTime<Local>,
         sound: Option<SoundHandle>,
@@ -34,7 +34,7 @@ pub enum MonitorEvent {
         started_at: DateTime<Local>,
     },
     TestAlarmPopup {
-        reminder: String,
+        label: String,
         fired_at: DateTime<Local>,
         sound: Option<SoundHandle>,
     },
@@ -153,7 +153,7 @@ fn run_monitor_loop(
                     let fired_at = Local::now();
                     let sound = play_alarm_sound(path, events.clone(), sound_player.as_ref());
                     let _ = events.send(MonitorEvent::TestAlarmPopup {
-                        reminder: "Test alarm notification".to_owned(),
+                        label: "Test alarm notification".to_owned(),
                         fired_at,
                         sound,
                     });
@@ -166,7 +166,7 @@ fn run_monitor_loop(
         let game_status = game_monitor.status();
 
         for event in engine.tick(now, game_status.activity()) {
-            if let Err(error) = notifier.alarm(&event.reminder) {
+            if let Err(error) = notifier.alarm(&event.label) {
                 let _ = events.send(MonitorEvent::NotificationError(error.to_string()));
             }
 
@@ -178,7 +178,7 @@ fn run_monitor_loop(
 
             let _ = events.send(MonitorEvent::AlarmFired {
                 id: event.id,
-                reminder: event.reminder,
+                label: event.label,
                 delayed_by_game: event.delayed_by_game,
                 fired_at: event.fired_at,
                 sound,

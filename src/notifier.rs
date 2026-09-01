@@ -2,15 +2,15 @@ use notify_rust::{Notification, Timeout};
 use thiserror::Error;
 
 pub trait Notifier: Send {
-    fn alarm(&self, reminder: &str) -> Result<(), NotificationError>;
+    fn alarm(&self, label: &str) -> Result<(), NotificationError>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct DesktopNotifier;
 
 impl Notifier for DesktopNotifier {
-    fn alarm(&self, reminder: &str) -> Result<(), NotificationError> {
-        show_notification(crate::APP_NAME, reminder)
+    fn alarm(&self, label: &str) -> Result<(), NotificationError> {
+        show_notification(crate::APP_NAME, label)
     }
 }
 
@@ -47,11 +47,11 @@ pub mod tests {
     }
 
     impl Notifier for RecordingNotifier {
-        fn alarm(&self, reminder: &str) -> Result<(), NotificationError> {
+        fn alarm(&self, label: &str) -> Result<(), NotificationError> {
             self.messages
                 .lock()
                 .expect("messages lock")
-                .push(reminder.to_owned());
+                .push(label.to_owned());
             Ok(())
         }
     }

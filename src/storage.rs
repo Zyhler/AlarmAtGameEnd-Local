@@ -1,4 +1,5 @@
 use crate::alarm::PendingAlarmSnapshot;
+use crate::discord_bridge::DiscordBridgeSettings;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -12,7 +13,7 @@ pub const DEFAULT_SOUND_PATH: &str = "sounds/universfield-alarm.mp3";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PersistedState {
-    pub reminder: String,
+    pub label: String,
     pub alarm_time: String,
     #[serde(default = "default_delay_for_games")]
     pub delay_for_games: bool,
@@ -33,6 +34,8 @@ pub struct PersistedState {
     pub theme_preference: PersistedThemePreference,
     #[serde(default)]
     pub graphics_backend_preference: PersistedGraphicsBackendPreference,
+    #[serde(default)]
+    pub discord_bridge: DiscordBridgeSettings,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -80,7 +83,7 @@ impl PersistedGraphicsBackendPreference {
 impl Default for PersistedState {
     fn default() -> Self {
         Self {
-            reminder: String::new(),
+            label: String::new(),
             alarm_time: "19:30".to_owned(),
             delay_for_games: default_delay_for_games(),
             lockfile_path: String::new(),
@@ -92,6 +95,7 @@ impl Default for PersistedState {
             last_reported_crash_fingerprint: None,
             theme_preference: PersistedThemePreference::System,
             graphics_backend_preference: PersistedGraphicsBackendPreference::Auto,
+            discord_bridge: DiscordBridgeSettings::default(),
         }
     }
 }
@@ -198,7 +202,7 @@ mod tests {
     fn default_state_has_alarm_settings() {
         let state = PersistedState::default();
 
-        assert!(state.reminder.is_empty());
+        assert!(state.label.is_empty());
         assert_eq!(state.alarm_time, "19:30");
         assert!(state.delay_for_games);
         assert!(state.lockfile_path.is_empty());
@@ -216,20 +220,21 @@ mod tests {
             state.graphics_backend_preference,
             PersistedGraphicsBackendPreference::Auto
         );
+        assert_eq!(state.discord_bridge, DiscordBridgeSettings::default());
     }
 
     #[test]
     fn saved_state_uses_current_defaults_for_missing_fields() {
         let state = load_state_from_str(
             r#"{
-                "reminder": "Stretch",
+                "label": "Stretch",
                 "alarm_time": "20:15",
                 "lockfile_path": "C:/Riot Games/League of Legends/lockfile"
             }"#,
         )
         .expect("saved state should parse");
 
-        assert_eq!(state.reminder, "Stretch");
+        assert_eq!(state.label, "Stretch");
         assert_eq!(state.alarm_time, "20:15");
         assert!(state.delay_for_games);
         assert_eq!(
@@ -249,13 +254,14 @@ mod tests {
             state.graphics_backend_preference,
             PersistedGraphicsBackendPreference::Auto
         );
+        assert_eq!(state.discord_bridge, DiscordBridgeSettings::default());
     }
 
     #[test]
     fn saved_state_keeps_theme_preference() {
         let state = load_state_from_str(
             r#"{
-                "reminder": "Stretch",
+                "label": "Stretch",
                 "alarm_time": "20:15",
                 "delay_for_games": true,
                 "lockfile_path": "",
@@ -275,7 +281,7 @@ mod tests {
     fn saved_state_keeps_graphics_backend_preference() {
         let state = load_state_from_str(
             r#"{
-                "reminder": "Stretch",
+                "label": "Stretch",
                 "alarm_time": "20:15",
                 "delay_for_games": true,
                 "lockfile_path": "",
@@ -294,7 +300,7 @@ mod tests {
     fn saved_state_keeps_explicit_blank_sound_path() {
         let state: PersistedState = serde_json::from_str(
             r#"{
-                "reminder": "Stretch",
+                "label": "Stretch",
                 "alarm_time": "20:15",
                 "delay_for_games": true,
                 "lockfile_path": "",
@@ -315,7 +321,7 @@ mod tests {
     fn saved_state_keeps_counter_strike_2_gsi_settings() {
         let state: PersistedState = serde_json::from_str(
             r#"{
-                "reminder": "Stretch",
+                "label": "Stretch",
                 "alarm_time": "20:15",
                 "delay_for_games": true,
                 "lockfile_path": "",
@@ -360,7 +366,7 @@ mod tests {
     fn save_state_to_path_writes_reloadable_state() {
         let path = unique_test_state_path();
         let mut state = PersistedState::default();
-        state.reminder = "Saved reminder".to_owned();
+        state.label = "Saved label".to_owned();
         state.logs.push(PersistedLogEntry {
             occurred_at: Local::now(),
             level: PersistedLogLevel::Error,
@@ -370,7 +376,7 @@ mod tests {
         save_state_to_path(&state, path.clone()).expect("state should save");
         let reloaded = load_state_from_path(path).expect("state should reload");
 
-        assert_eq!(reloaded.reminder, "Saved reminder");
+        assert_eq!(reloaded.label, "Saved label");
         assert_eq!(reloaded.logs, state.logs);
     }
 

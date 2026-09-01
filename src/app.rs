@@ -6,6 +6,10 @@ use crate::counter_strike::{
     COUNTER_STRIKE_2_GAME_NAME, Cs2GsiConfigStatus, counter_strike_2_gsi_config_status,
     install_counter_strike_2_gsi_config,
 };
+use crate::discord_bridge::{
+    self, CompanionInvite, DiscordBridgeSettings, InviteStatus, PairingRegistrationResponse,
+    PollRequestsResponse, RemoteAlarmRequest as RemoteDiscordAlarmRequest, RequestStatus,
+};
 use crate::game::{GameDetectionConfig, GameStatus};
 use crate::league::GAME_NAME as LEAGUE_OF_LEGENDS_GAME_NAME;
 use crate::sound::{SoundHandle, sound_path_from_text};
@@ -14,10 +18,12 @@ use crate::storage::{
     PersistedThemePreference,
 };
 use crate::worker::{MonitorCommand, MonitorEvent, MonitorHandle, MonitorSnapshot};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use eframe::egui;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const INLINE_DETECTED_GAME_LIMIT: usize = 4;
 const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(1000);
@@ -35,12 +41,20 @@ pub struct AlarmApp {
     logs: Vec<LogEntry>,
     current_page: AppPage,
     accent_color: egui::Color32,
+    bridge_registration: Option<Receiver<Result<PairingRegistrationResponse, String>>>,
+    bridge_poll: Option<Receiver<Result<PollRequestsResponse, String>>>,
+    next_bridge_poll_at: Instant,
+    bridge_status: String,
+    handled_bridge_request_ids: Vec<u64>,
+    pending_companion_invites: Vec<CompanionInvite>,
+    new_allowed_requester_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AppPage {
     Alarm,
     Games,
+    Discord,
     Log,
     Settings,
 }
@@ -77,7 +91,7 @@ struct LogEntry {
 #[derive(Debug)]
 struct AlarmPopup {
     id: u64,
-    reminder: String,
+    label: String,
     fired_at: DateTime<Local>,
     delayed_by_game: bool,
     missed: bool,
@@ -139,6 +153,13 @@ impl AlarmApp {
             logs,
             current_page: AppPage::Alarm,
             accent_color,
+            bridge_registration: None,
+            bridge_poll: None,
+            next_bridge_poll_at: Instant::now(),
+            bridge_status: "Disconnected".to_owned(),
+            handled_bridge_request_ids: Vec::new(),
+            pending_companion_invites: Vec::new(),
+            new_allowed_requester_id: String::new(),
         };
 
         app.log_info("Ready");
@@ -190,14 +211,14 @@ impl AlarmApp {
                 }
                 MonitorEvent::AlarmFired {
                     id,
-                    reminder,
+                    label,
                     delayed_by_game,
                     fired_at,
                     sound,
                 } => {
                     self.snapshot.alarm.alarms.retain(|alarm| alarm.id != id);
                     self.snapshot.alarm.fired_at = Some(fired_at);
-                    self.snapshot.alarm.last_fired_reminder = Some(reminder.clone());
+                    self.snapshot.alarm.last_fired_label = Some(label.clone());
                     refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
 
                     let suffix = if delayed_by_game {
@@ -206,15 +227,15 @@ impl AlarmApp {
                         ""
                     };
                     let message = format!(
-                        "Alarm fired at {}{suffix}: {reminder}",
+                        "Alarm fired at {}{suffix}: {label}",
                         format_datetime(fired_at)
                     );
                     self.log_at(LogLevel::Info, fired_at, message);
-                    self.push_alarm_popup(reminder, fired_at, delayed_by_game, false, sound);
+                    self.push_alarm_popup(label, fired_at, delayed_by_game, false, sound);
                     request_alarm_attention(ctx);
                 }
                 MonitorEvent::TestAlarmPopup {
-                    reminder,
+                    label,
                     fired_at,
                     sound,
                 } => {
@@ -223,7 +244,7 @@ impl AlarmApp {
                         fired_at,
                         format!("Test alarm popup shown at {}", format_time(fired_at)),
                     );
-                    self.push_alarm_popup(reminder, fired_at, false, false, sound);
+                    self.push_alarm_popup(label, fired_at, false, false, sound);
                     request_alarm_attention(ctx);
                 }
                 MonitorEvent::TestSoundStarted { sound, started_at } => {
@@ -253,7 +274,7 @@ impl AlarmApp {
 
     fn push_alarm_popup(
         &mut self,
-        reminder: String,
+        label: String,
         fired_at: DateTime<Local>,
         delayed_by_game: bool,
         missed: bool,
@@ -264,7 +285,7 @@ impl AlarmApp {
 
         self.alarm_popups.push(AlarmPopup {
             id,
-            reminder,
+            label,
             fired_at,
             delayed_by_game,
             missed,
@@ -273,18 +294,18 @@ impl AlarmApp {
     }
 
     fn show_missed_alarm(&mut self, alarm: PendingAlarmSnapshot) {
-        let reminder = alarm.alarm.reminder.clone();
+        let label = alarm.alarm.label.clone();
         let scheduled_for = alarm.alarm.scheduled_for;
 
         self.log_at(
             LogLevel::Error,
             Local::now(),
             format!(
-                "Missed alarm from {} while the app was not running: {reminder}",
+                "Missed alarm from {} while the app was not running: {label}",
                 format_datetime(scheduled_for)
             ),
         );
-        self.push_alarm_popup(reminder, scheduled_for, alarm.delayed_by_game, true, None);
+        self.push_alarm_popup(label, scheduled_for, alarm.delayed_by_game, true, None);
     }
 
     fn clear_finished_test_sound(&mut self) -> bool {
@@ -375,33 +396,10 @@ impl AlarmApp {
             return;
         }
 
-        match next_alarm_time(&self.state.alarm_time, Local::now()) {
-            Ok(scheduled_for) => {
-                let reminder = if self.state.reminder.trim().is_empty() {
-                    "Reminder".to_owned()
-                } else {
-                    self.state.reminder.trim().to_owned()
-                };
-                let alarm = Alarm::with_sound(
-                    reminder.clone(),
-                    scheduled_for,
-                    self.state.delay_for_games,
-                    sound_path_from_text(&self.state.sound_path),
-                );
-                let id = self.next_alarm_id;
-                self.next_alarm_id = self.next_alarm_id.saturating_add(1);
-                self.snapshot.alarm.alarms.push(PendingAlarmSnapshot {
-                    id,
-                    alarm: alarm.clone(),
-                    status: AlarmStatus::Scheduled,
-                    delayed_by_game: false,
-                });
-                sort_alarm_snapshots(&mut self.snapshot.alarm.alarms);
-                self.snapshot.alarm.fired_at = None;
-                self.snapshot.alarm.last_fired_reminder = None;
-                refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+        let label = alarm_label_from_text(&self.state.label);
 
-                self.monitor.send(MonitorCommand::Schedule { id, alarm });
+        match self.schedule_alarm_from_values(label, self.state.alarm_time.clone()) {
+            Ok(scheduled_for) => {
                 self.log_info(format!(
                     "Alarm added for {}",
                     format_datetime(scheduled_for)
@@ -411,6 +409,35 @@ impl AlarmApp {
                 self.log_error(error.to_string());
             }
         }
+    }
+
+    fn schedule_alarm_from_values(
+        &mut self,
+        label: String,
+        alarm_time: String,
+    ) -> Result<DateTime<Local>, AlarmTimeError> {
+        let scheduled_for = next_alarm_time(&alarm_time, Local::now())?;
+        let alarm = Alarm::with_sound(
+            label,
+            scheduled_for,
+            self.state.delay_for_games,
+            sound_path_from_text(&self.state.sound_path),
+        );
+        let id = self.next_alarm_id;
+        self.next_alarm_id = self.next_alarm_id.saturating_add(1);
+        self.snapshot.alarm.alarms.push(PendingAlarmSnapshot {
+            id,
+            alarm: alarm.clone(),
+            status: AlarmStatus::Scheduled,
+            delayed_by_game: false,
+        });
+        sort_alarm_snapshots(&mut self.snapshot.alarm.alarms);
+        self.snapshot.alarm.fired_at = None;
+        self.snapshot.alarm.last_fired_label = None;
+        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+
+        self.monitor.send(MonitorCommand::Schedule { id, alarm });
+        Ok(scheduled_for)
     }
 
     fn save_settings(&mut self) -> bool {
@@ -443,13 +470,460 @@ impl AlarmApp {
         }
     }
 
+    fn start_bridge_pairing(&mut self) {
+        if self.bridge_registration.is_some() {
+            self.set_bridge_status("Pairing registration already in progress");
+            return;
+        }
+
+        if self
+            .state
+            .discord_bridge
+            .paired_discord_user_id
+            .as_deref()
+            .is_some_and(|user_id| !user_id.trim().is_empty())
+        {
+            self.set_bridge_status("Clear pairing before generating a new code");
+            return;
+        }
+
+        if self.state.discord_bridge.bridge_url.trim().is_empty() {
+            self.log_error("Discord bridge URL is blank");
+            return;
+        }
+
+        if discord_bridge::ensure_credentials(&mut self.state.discord_bridge) {
+            self.persist_current_state();
+        }
+
+        let pairing_code = discord_bridge::generate_pairing_code();
+        self.state.discord_bridge.pairing_code = pairing_code.clone();
+        self.state.discord_bridge.pairing_expires_at = None;
+        self.state.discord_bridge.poll_enabled = true;
+        self.persist_current_state();
+
+        let config = match self.state.discord_bridge.client_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.log_error(format!("Discord bridge is not ready: {error}"));
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+
+        thread::spawn(move || {
+            let result = discord_bridge::register_pairing(&config, &pairing_code)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+
+        self.bridge_registration = Some(receiver);
+        self.set_bridge_status("Registering pairing code");
+    }
+
+    fn clear_bridge_pairing(&mut self) {
+        self.state.discord_bridge.companion_id.clear();
+        self.state.discord_bridge.api_token.clear();
+        self.state.discord_bridge.pairing_code.clear();
+        self.state.discord_bridge.pairing_expires_at = None;
+        self.state.discord_bridge.paired_discord_user_id = None;
+        self.state.discord_bridge.paired_discord_user_label = None;
+        self.state.discord_bridge.allowed_requester_ids.clear();
+        self.state.discord_bridge.allowed_requesters.clear();
+        self.state.discord_bridge.poll_enabled = false;
+        self.handled_bridge_request_ids.clear();
+        self.pending_companion_invites.clear();
+        self.persist_current_state();
+        self.set_bridge_status("Disconnected");
+    }
+
+    fn clear_inactive_bridge_pairing_code(&mut self) -> bool {
+        if self.bridge_registration.is_some() {
+            return false;
+        }
+
+        if clear_inactive_pairing_code(&mut self.state.discord_bridge, Local::now()) {
+            self.persist_current_state();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn drain_bridge_tasks(&mut self, ctx: &egui::Context) -> bool {
+        let mut changed = false;
+
+        let registration_result =
+            self.bridge_registration
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("Pairing registration worker stopped".to_owned()))
+                    }
+                });
+
+        if let Some(result) = registration_result {
+            self.bridge_registration = None;
+            changed = true;
+
+            match result {
+                Ok(response) => {
+                    self.state.discord_bridge.pairing_code = response.pairing_code;
+                    self.state.discord_bridge.pairing_expires_at =
+                        local_datetime_from_unix(response.expires_at_unix);
+                    self.persist_current_state();
+                    self.log_info("Discord pairing code registered");
+                    self.set_bridge_status("Waiting for /companion pair");
+                    self.next_bridge_poll_at = Instant::now();
+                }
+                Err(error) => {
+                    self.state.discord_bridge.pairing_code.clear();
+                    self.state.discord_bridge.pairing_expires_at = None;
+                    self.persist_current_state();
+                    self.log_error(format!("Could not register Discord pairing code: {error}"));
+                    self.set_bridge_status("Pairing failed");
+                }
+            }
+        }
+
+        let poll_result =
+            self.bridge_poll
+                .as_ref()
+                .and_then(|receiver| match receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("Discord bridge polling worker stopped".to_owned()))
+                    }
+                });
+
+        if let Some(result) = poll_result {
+            self.bridge_poll = None;
+            changed = true;
+
+            match result {
+                Ok(response) => {
+                    self.process_bridge_poll_response(response, ctx);
+                }
+                Err(error) => {
+                    self.set_bridge_status(format!("Bridge poll failed: {error}"));
+                }
+            }
+        }
+
+        changed
+    }
+
+    fn maybe_start_bridge_poll(&mut self) {
+        if !self.state.discord_bridge.can_poll()
+            || self.bridge_poll.is_some()
+            || self.bridge_registration.is_some()
+            || Instant::now() < self.next_bridge_poll_at
+        {
+            return;
+        }
+
+        let config = match self.state.discord_bridge.client_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.set_bridge_status(format!("Discord bridge is not ready: {error}"));
+                return;
+            }
+        };
+        let (sender, receiver) = mpsc::channel();
+
+        self.next_bridge_poll_at = Instant::now() + discord_bridge::POLL_INTERVAL;
+        thread::spawn(move || {
+            let result = discord_bridge::poll_requests(&config).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+
+        self.bridge_poll = Some(receiver);
+    }
+
+    fn process_bridge_poll_response(
+        &mut self,
+        response: PollRequestsResponse,
+        ctx: &egui::Context,
+    ) {
+        if !response.paired {
+            self.state.discord_bridge.paired_discord_user_id = None;
+            self.state.discord_bridge.paired_discord_user_label = None;
+            self.pending_companion_invites.clear();
+            self.persist_current_state();
+            self.set_bridge_status("Waiting for /companion pair");
+            return;
+        }
+
+        let mut bridge_settings_changed = false;
+
+        if self.state.discord_bridge.paired_discord_user_id != response.paired_discord_user_id
+            || self.state.discord_bridge.paired_discord_user_label
+                != response.paired_discord_user_label
+        {
+            self.state.discord_bridge.paired_discord_user_id =
+                response.paired_discord_user_id.clone();
+            self.state.discord_bridge.paired_discord_user_label =
+                response.paired_discord_user_label.clone();
+            bridge_settings_changed = true;
+        }
+
+        if clear_inactive_pairing_code(&mut self.state.discord_bridge, Local::now()) {
+            bridge_settings_changed = true;
+        }
+
+        if bridge_settings_changed {
+            self.persist_current_state();
+        }
+
+        let request_count = response.requests.len();
+        for request in response.requests {
+            self.process_remote_discord_alarm_request(request);
+        }
+
+        let new_invite_labels =
+            new_companion_invite_labels(&self.pending_companion_invites, &response.invites);
+        self.pending_companion_invites = response.invites;
+        let invite_count = self.pending_companion_invites.len();
+
+        if !new_invite_labels.is_empty() {
+            self.current_page = AppPage::Discord;
+            request_alarm_attention(ctx);
+            self.log_info(format!(
+                "Pending Discord access invite: {}",
+                new_invite_labels.join(", ")
+            ));
+        }
+
+        if request_count == 0 && invite_count == 0 {
+            self.set_bridge_status("Connected");
+        } else {
+            self.set_bridge_status(format!(
+                "Connected; processed {request_count} request(s), {invite_count} invite(s) pending"
+            ));
+        }
+    }
+
+    fn process_remote_discord_alarm_request(&mut self, request: RemoteDiscordAlarmRequest) {
+        if self.handled_bridge_request_ids.contains(&request.id) {
+            self.report_bridge_request_status(
+                request.id,
+                RequestStatus::Accepted,
+                Some("already handled".to_owned()),
+            );
+            return;
+        }
+
+        let Some(owner_discord_user_id) = self
+            .state
+            .discord_bridge
+            .paired_discord_user_id
+            .as_deref()
+            .map(str::to_owned)
+        else {
+            self.reject_remote_discord_alarm_request(request.id, "companion is not paired");
+            return;
+        };
+
+        if request.target_id != owner_discord_user_id {
+            self.reject_remote_discord_alarm_request(request.id, "target Discord user mismatch");
+            return;
+        }
+
+        if !discord_bridge::requester_is_allowed(
+            &owner_discord_user_id,
+            &self.state.discord_bridge.allowed_requester_ids,
+            &request.requester_id,
+        ) {
+            self.reject_remote_discord_alarm_request(request.id, "requester is not allowed");
+            self.log_error(format!(
+                "Rejected Discord alarm request #{} from {}",
+                request.id, request.requester_id
+            ));
+            return;
+        }
+
+        match self
+            .schedule_alarm_from_values(alarm_label_from_text(&request.label), request.time_text())
+        {
+            Ok(scheduled_for) => {
+                self.remember_bridge_request_id(request.id);
+                self.report_bridge_request_status(request.id, RequestStatus::Accepted, None);
+                self.log_info(format!(
+                    "Accepted Discord alarm request #{} for {}",
+                    request.id,
+                    format_datetime(scheduled_for)
+                ));
+            }
+            Err(error) => {
+                self.reject_remote_discord_alarm_request(request.id, &error.to_string());
+            }
+        }
+    }
+
+    fn reject_remote_discord_alarm_request(&self, request_id: u64, reason: &str) {
+        self.report_bridge_request_status(
+            request_id,
+            RequestStatus::Rejected,
+            Some(reason.to_owned()),
+        );
+    }
+
+    fn report_bridge_request_status(
+        &self,
+        request_id: u64,
+        status: RequestStatus,
+        reason: Option<String>,
+    ) {
+        let Ok(config) = self.state.discord_bridge.client_config() else {
+            return;
+        };
+
+        thread::spawn(move || {
+            let _ = discord_bridge::report_request_status(
+                &config,
+                request_id,
+                status,
+                reason.as_deref(),
+            );
+        });
+    }
+
+    fn allow_companion_invite(&mut self, invite_id: u64) {
+        let Some(invite) = self
+            .pending_companion_invites
+            .iter()
+            .find(|invite| invite.id == invite_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.state.discord_bridge.allowed_requester_ids = discord_bridge::add_allowed_requester(
+            &self.state.discord_bridge.allowed_requester_ids,
+            &invite.invitee_id,
+        );
+        discord_bridge::remember_allowed_requester(
+            &mut self.state.discord_bridge,
+            &invite.invitee_id,
+            &invite.invitee_label,
+        );
+        self.pending_companion_invites
+            .retain(|invite| invite.id != invite_id);
+        self.persist_current_state();
+        self.report_bridge_invite_status(invite_id, InviteStatus::Allowed);
+        self.log_info(format!(
+            "Allowed {} to request alarms",
+            discord_invite_user_label(&invite)
+        ));
+    }
+
+    fn reject_companion_invite(&mut self, invite_id: u64) {
+        let Some(invite) = self
+            .pending_companion_invites
+            .iter()
+            .find(|invite| invite.id == invite_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        self.pending_companion_invites
+            .retain(|invite| invite.id != invite_id);
+        self.report_bridge_invite_status(invite_id, InviteStatus::Rejected);
+        self.log_info(format!(
+            "Rejected Discord access invite for {}",
+            discord_invite_user_label(&invite)
+        ));
+    }
+
+    fn report_bridge_invite_status(&self, invite_id: u64, status: InviteStatus) {
+        let Ok(config) = self.state.discord_bridge.client_config() else {
+            return;
+        };
+
+        thread::spawn(move || {
+            let _ = discord_bridge::report_invite_status(&config, invite_id, status);
+        });
+    }
+
+    fn add_allowed_requester_from_input(&mut self) {
+        let input = self.new_allowed_requester_id.trim().to_owned();
+
+        if input.is_empty() {
+            self.log_error("Allowed Discord user field is blank");
+            return;
+        }
+
+        let previous_ids =
+            discord_bridge::allowed_requester_ids(&self.state.discord_bridge.allowed_requester_ids);
+        let updated_ids = discord_bridge::add_allowed_requester(
+            &self.state.discord_bridge.allowed_requester_ids,
+            &input,
+        );
+        let next_ids = discord_bridge::allowed_requester_ids(&updated_ids);
+
+        if next_ids == previous_ids {
+            self.log_error("Discord user is already allowed or the ID is invalid");
+            return;
+        }
+
+        let added_id = next_ids
+            .iter()
+            .find(|id| !previous_ids.contains(id))
+            .cloned()
+            .unwrap_or_else(|| input.clone());
+
+        self.state.discord_bridge.allowed_requester_ids = updated_ids;
+        discord_bridge::remember_allowed_requester(&mut self.state.discord_bridge, &added_id, "");
+        self.new_allowed_requester_id.clear();
+        self.persist_current_state();
+        self.log_info(format!("Allowed Discord user {added_id} to request alarms"));
+    }
+
+    fn remove_allowed_requester(&mut self, user_id: &str) {
+        self.state.discord_bridge.allowed_requester_ids = discord_bridge::remove_allowed_requester(
+            &self.state.discord_bridge.allowed_requester_ids,
+            user_id,
+        );
+        discord_bridge::forget_allowed_requester(&mut self.state.discord_bridge, user_id);
+        self.persist_current_state();
+        self.log_info(format!("Removed Discord user {user_id} from allowed users"));
+    }
+
+    fn remember_bridge_request_id(&mut self, request_id: u64) {
+        if self.handled_bridge_request_ids.contains(&request_id) {
+            return;
+        }
+
+        self.handled_bridge_request_ids.push(request_id);
+
+        if self.handled_bridge_request_ids.len() > 500 {
+            let overflow_count = self.handled_bridge_request_ids.len() - 500;
+            self.handled_bridge_request_ids.drain(..overflow_count);
+        }
+    }
+
+    fn set_bridge_status(&mut self, status: impl Into<String>) -> bool {
+        let status = status.into();
+
+        if self.bridge_status == status {
+            false
+        } else {
+            self.bridge_status = status;
+            true
+        }
+    }
+
     fn alarm_summary(&self) -> String {
         let alarm_count = self.snapshot.alarm.alarms.len();
 
         if let Some(next_alarm) = self.snapshot.alarm.alarms.first() {
             let next_alarm_text = format!(
                 "{} at {}",
-                next_alarm.alarm.reminder,
+                next_alarm.alarm.label,
                 format_datetime(next_alarm.alarm.scheduled_for)
             );
 
@@ -459,9 +933,9 @@ impl AlarmApp {
                 format!("{alarm_count} alarms scheduled, next: {next_alarm_text}")
             }
         } else if let Some(fired_at) = self.snapshot.alarm.fired_at {
-            match &self.snapshot.alarm.last_fired_reminder {
-                Some(reminder) => {
-                    format!("Last fired at {}: {reminder}", format_datetime(fired_at))
+            match &self.snapshot.alarm.last_fired_label {
+                Some(label) => {
+                    format!("Last fired at {}: {label}", format_datetime(fired_at))
                 }
                 None => format!("Last fired at {}", format_datetime(fired_at)),
             }
@@ -486,14 +960,16 @@ impl AlarmApp {
             .striped(true)
             .show(ui, |ui| {
                 ui.strong("Time");
-                ui.strong("Reminder");
+                ui.strong("Label");
                 ui.strong("Status");
                 ui.label("");
                 ui.end_row();
 
                 for pending_alarm in alarms {
-                    ui.label(format_datetime(pending_alarm.alarm.scheduled_for));
-                    ui.label(&pending_alarm.alarm.reminder);
+                    ui.label(format_alarm_list_datetime(
+                        pending_alarm.alarm.scheduled_for,
+                    ));
+                    ui.label(&pending_alarm.alarm.label);
                     ui.label(pending_alarm.status.as_str());
 
                     if accent_button(ui, "Cancel", self.accent_color).clicked() {
@@ -504,7 +980,7 @@ impl AlarmApp {
                             .alarms
                             .retain(|alarm| alarm.id != pending_alarm.id);
                         refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
-                        self.log_info(format!("Alarm cancelled: {}", pending_alarm.alarm.reminder));
+                        self.log_info(format!("Alarm cancelled: {}", pending_alarm.alarm.label));
                     }
 
                     ui.end_row();
@@ -522,9 +998,16 @@ impl AlarmApp {
     }
 
     fn draw_navigation(&mut self, ui: &mut egui::Ui) {
+        let discord_label = if self.pending_companion_invites.is_empty() {
+            "Discord".to_owned()
+        } else {
+            format!("Discord ({})", self.pending_companion_invites.len())
+        };
+
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.current_page, AppPage::Alarm, "Alarm");
             ui.selectable_value(&mut self.current_page, AppPage::Games, "Games");
+            ui.selectable_value(&mut self.current_page, AppPage::Discord, discord_label);
             ui.selectable_value(&mut self.current_page, AppPage::Log, "Log");
             ui.selectable_value(&mut self.current_page, AppPage::Settings, "Settings");
         });
@@ -565,7 +1048,7 @@ impl AlarmApp {
                 ui.label(self.alarm_status_label());
                 ui.end_row();
 
-                ui.label("Reminder");
+                ui.label("Label");
                 ui.label(self.alarm_summary());
                 ui.end_row();
 
@@ -584,12 +1067,12 @@ impl AlarmApp {
         ui.separator();
 
         ui.horizontal(|ui| {
-            ui.label("Reminder");
+            ui.label("Alarm label");
             let response = text_input(
                 ui,
                 self.accent_color,
-                "reminder_input",
-                &mut self.state.reminder,
+                "label_input",
+                &mut self.state.label,
                 260.0,
                 "ex: go get laundry",
             );
@@ -624,7 +1107,7 @@ impl AlarmApp {
 
             ui.colored_label(
                 crate::theme::muted_text_color(ui.visuals()),
-                "HH.MM, HH:MM, HH,MM, or 1554",
+                "HH.MM, HH:MM, HH,MM, 125, or 1554",
             );
         });
         if readable_checkbox(
@@ -649,7 +1132,7 @@ impl AlarmApp {
                 self.monitor.send(MonitorCommand::Cancel);
                 self.snapshot.alarm.alarms.clear();
                 self.snapshot.alarm.fired_at = None;
-                self.snapshot.alarm.last_fired_reminder = None;
+                self.snapshot.alarm.last_fired_label = None;
                 refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
                 self.log_info("All alarms cancelled");
             }
@@ -732,6 +1215,156 @@ impl AlarmApp {
         ui.separator();
         if accent_button(ui, "Save Settings", self.accent_color).clicked() && self.save_settings() {
             self.log_info("Settings saved");
+        }
+    }
+
+    fn draw_discord_bridge_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Discord Settings");
+
+        ui.separator();
+        ui.heading("Bot Link");
+
+        ui.horizontal(|ui| {
+            ui.label("Bridge URL");
+            let response = text_input(
+                ui,
+                self.accent_color,
+                "discord_bridge_url",
+                &mut self.state.discord_bridge.bridge_url,
+                360.0,
+                "https://alarmbot.example.com",
+            );
+
+            if response.changed() {
+                self.persist_current_state();
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Status");
+            ui.label(&self.bridge_status);
+        });
+
+        ui.separator();
+        ui.heading("Pairing");
+
+        ui.horizontal(|ui| {
+            if accent_button(ui, "Generate Pairing Code", self.accent_color).clicked() {
+                self.start_bridge_pairing();
+            }
+
+            if accent_button(ui, "Clear Pairing", self.accent_color).clicked() {
+                self.clear_bridge_pairing();
+            }
+        });
+
+        if let Some(pairing_code) = visible_pairing_code(&self.state.discord_bridge, Local::now()) {
+            ui.horizontal(|ui| {
+                ui.label("Pairing code");
+                ui.strong(pairing_code);
+            });
+
+            if let Some(expires_at) = self.state.discord_bridge.pairing_expires_at {
+                ui.label(format!("Expires {}", format_expiry_datetime(expires_at)));
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Paired account");
+            ui.label(paired_discord_account_label(&self.state.discord_bridge));
+        });
+
+        self.draw_pending_companion_invites(ui);
+
+        ui.separator();
+        self.draw_allowed_discord_users(ui);
+    }
+
+    fn draw_allowed_discord_users(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Allowed Users");
+
+        let users = allowed_discord_user_rows(&self.state.discord_bridge);
+        if users.is_empty() {
+            ui.label("No extra allowed Discord users");
+        } else {
+            let mut remove_user_id = None;
+
+            egui::Grid::new("allowed_discord_users_grid")
+                .num_columns(3)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("User");
+                    ui.strong("Discord ID");
+                    ui.end_row();
+
+                    for user in &users {
+                        ui.label(&user.display_name);
+                        ui.monospace(&user.discord_user_id);
+
+                        if accent_button(ui, "Remove", self.accent_color).clicked() {
+                            remove_user_id = Some(user.discord_user_id.clone());
+                        }
+
+                        ui.end_row();
+                    }
+                });
+
+            if let Some(user_id) = remove_user_id {
+                self.remove_allowed_requester(&user_id);
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Add by ID");
+            let input_height = ui.spacing().interact_size.y;
+            text_input_with_min_height(
+                ui,
+                self.accent_color,
+                "discord_new_allowed_requester_id",
+                &mut self.new_allowed_requester_id,
+                260.0,
+                "Discord ID or mention",
+                input_height,
+            );
+
+            if accent_button(ui, "Add", self.accent_color).clicked() {
+                self.add_allowed_requester_from_input();
+            }
+        });
+    }
+
+    fn draw_pending_companion_invites(&mut self, ui: &mut egui::Ui) {
+        if self.pending_companion_invites.is_empty() {
+            return;
+        }
+
+        ui.separator();
+        ui.heading("Pending Access Invites");
+
+        let invites = self.pending_companion_invites.clone();
+        for invite in invites {
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!(
+                        "Allow {} to request alarms",
+                        discord_invite_user_label(&invite)
+                    ));
+
+                    if accent_button(ui, "Allow", self.accent_color).clicked() {
+                        self.allow_companion_invite(invite.id);
+                    }
+
+                    if accent_button(ui, "Reject", self.accent_color).clicked() {
+                        self.reject_companion_invite(invite.id);
+                    }
+                });
+
+                if let Some(expires_at) = local_datetime_from_unix(invite.expires_at_unix) {
+                    ui.label(format!("Expires {}", format_expiry_datetime(expires_at)));
+                }
+            });
         }
     }
 
@@ -945,6 +1578,7 @@ impl AlarmApp {
         match self.current_page {
             AppPage::Alarm => self.draw_alarm_panel(ui),
             AppPage::Games => self.draw_games_panel(ui),
+            AppPage::Discord => self.draw_discord_bridge_settings(ui),
             AppPage::Log => self.draw_log_panel(ui),
             AppPage::Settings => self.draw_settings_panel(ui),
         }
@@ -997,11 +1631,11 @@ impl AlarmApp {
                         ui.group(|ui| {
                             ui.set_width(ui.available_width());
                             if popup.missed {
-                                ui.strong(format!("Missed alarm: {}", popup.reminder));
+                                ui.strong(format!("Missed alarm: {}", popup.label));
                                 ui.label(format!("Was due at {}", format_datetime(popup.fired_at)));
                                 ui.label("No sound was played.");
                             } else {
-                                ui.strong(&popup.reminder);
+                                ui.strong(&popup.label);
                                 ui.label(format!("Fired at {}", format_datetime(popup.fired_at)));
                             }
 
@@ -1033,7 +1667,11 @@ impl eframe::App for AlarmApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let state_changed = self.drain_monitor_events(ctx) | self.clear_finished_test_sound();
+        let state_changed = self.drain_monitor_events(ctx)
+            | self.clear_finished_test_sound()
+            | self.clear_inactive_bridge_pairing_code()
+            | self.drain_bridge_tasks(ctx);
+        self.maybe_start_bridge_poll();
 
         if state_changed {
             ctx.request_repaint();
@@ -1043,7 +1681,11 @@ impl eframe::App for AlarmApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let state_changed = self.drain_monitor_events(ui.ctx()) | self.clear_finished_test_sound();
+        let state_changed = self.drain_monitor_events(ui.ctx())
+            | self.clear_finished_test_sound()
+            | self.clear_inactive_bridge_pairing_code()
+            | self.drain_bridge_tasks(ui.ctx());
+        self.maybe_start_bridge_poll();
 
         if state_changed {
             ui.ctx().request_repaint();
@@ -1184,6 +1826,12 @@ struct GameStatusRow<'a> {
     state: &'static str,
     detail: Option<&'a str>,
     color: egui::Color32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AllowedDiscordUserRow {
+    discord_user_id: String,
+    display_name: String,
 }
 
 fn draw_compact_game_status(ui: &mut egui::Ui, status: &GameStatus) {
@@ -1393,17 +2041,60 @@ fn text_input(
     desired_width: f32,
     hint_text: &'static str,
 ) -> egui::Response {
+    text_input_with_optional_min_height(
+        ui,
+        accent_color,
+        id_salt,
+        value,
+        desired_width,
+        hint_text,
+        None,
+    )
+}
+
+fn text_input_with_min_height(
+    ui: &mut egui::Ui,
+    accent_color: egui::Color32,
+    id_salt: impl egui::AsIdSalt,
+    value: &mut String,
+    desired_width: f32,
+    hint_text: &'static str,
+    min_height: f32,
+) -> egui::Response {
+    text_input_with_optional_min_height(
+        ui,
+        accent_color,
+        id_salt,
+        value,
+        desired_width,
+        hint_text,
+        Some(min_height),
+    )
+}
+
+fn text_input_with_optional_min_height(
+    ui: &mut egui::Ui,
+    accent_color: egui::Color32,
+    id_salt: impl egui::AsIdSalt,
+    value: &mut String,
+    desired_width: f32,
+    hint_text: &'static str,
+    min_height: Option<f32>,
+) -> egui::Response {
     with_input_visuals(ui, accent_color, |ui| {
         let id = ui.make_persistent_id(id_salt);
         let has_focus = ui.memory(|memory| memory.has_focus(id));
         let hint_text = if has_focus { "" } else { hint_text };
+        let mut text_edit = egui::TextEdit::singleline(value)
+            .desired_width(desired_width)
+            .id(id)
+            .hint_text(hint_text);
 
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width(desired_width)
-                .id(id)
-                .hint_text(hint_text),
-        )
+        if let Some(min_height) = min_height {
+            text_edit = text_edit.min_size(egui::vec2(desired_width, min_height));
+        }
+
+        ui.add(text_edit)
     })
 }
 
@@ -1429,6 +2120,15 @@ fn accent_button(
     label: &'static str,
     accent_color: egui::Color32,
 ) -> egui::Response {
+    accent_button_with_min_size(ui, label, accent_color, true)
+}
+
+fn accent_button_with_min_size(
+    ui: &mut egui::Ui,
+    label: &'static str,
+    accent_color: egui::Color32,
+    use_min_height: bool,
+) -> egui::Response {
     ui.scope(|ui| {
         let dark_mode = ui.visuals().dark_mode;
         let text_color = crate::theme::contrast_text_color(accent_color);
@@ -1449,7 +2149,12 @@ fn accent_button(
         visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_color);
         visuals.widgets.active.expansion = -ACCENT_BUTTON_PRESSED_SHRINK;
 
-        ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, ui.spacing().interact_size.y)))
+        let mut button = egui::Button::new(label);
+        if use_min_height {
+            button = button.min_size(egui::vec2(0.0, ui.spacing().interact_size.y));
+        }
+
+        ui.add(button)
     })
     .inner
 }
@@ -1573,13 +2278,137 @@ fn format_datetime(value: DateTime<Local>) -> String {
     value.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+fn format_alarm_list_datetime(value: DateTime<Local>) -> String {
+    value.format("%H:%M %d-%m-%Y").to_string()
+}
+
+fn format_expiry_datetime(value: DateTime<Local>) -> String {
+    value.format("%H:%M, %d-%m-%Y").to_string()
+}
+
 fn format_time(value: DateTime<Local>) -> String {
     value.format("%H:%M:%S").to_string()
+}
+
+fn paired_discord_account_label(settings: &DiscordBridgeSettings) -> String {
+    let Some(user_id) = settings.paired_discord_user_id.as_deref() else {
+        return "-".to_owned();
+    };
+
+    let label = settings
+        .paired_discord_user_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+
+    if let Some(label) = label {
+        format!("{label} (ID: {user_id})")
+    } else {
+        format!("ID: {user_id}")
+    }
+}
+
+fn visible_pairing_code(settings: &DiscordBridgeSettings, now: DateTime<Local>) -> Option<&str> {
+    let pairing_code = settings.pairing_code.trim();
+
+    if pairing_code.is_empty()
+        || settings
+            .paired_discord_user_id
+            .as_deref()
+            .is_some_and(|user_id| !user_id.trim().is_empty())
+        || match settings.pairing_expires_at {
+            Some(expires_at) => expires_at <= now,
+            None => true,
+        }
+    {
+        None
+    } else {
+        Some(pairing_code)
+    }
+}
+
+fn clear_inactive_pairing_code(settings: &mut DiscordBridgeSettings, now: DateTime<Local>) -> bool {
+    if settings.pairing_code.trim().is_empty() && settings.pairing_expires_at.is_none() {
+        return false;
+    }
+
+    if visible_pairing_code(settings, now).is_some() {
+        return false;
+    }
+
+    settings.pairing_code.clear();
+    settings.pairing_expires_at = None;
+    true
+}
+
+fn discord_user_label(user_id: &str) -> String {
+    format!("<@{user_id}>")
+}
+
+fn discord_invite_user_label(invite: &CompanionInvite) -> String {
+    let label = invite.invitee_label.trim();
+
+    if label.is_empty() {
+        discord_user_label(&invite.invitee_id)
+    } else {
+        label.to_owned()
+    }
+}
+
+fn new_companion_invite_labels(
+    existing_invites: &[CompanionInvite],
+    incoming_invites: &[CompanionInvite],
+) -> Vec<String> {
+    incoming_invites
+        .iter()
+        .filter(|incoming_invite| {
+            !existing_invites
+                .iter()
+                .any(|existing_invite| existing_invite.id == incoming_invite.id)
+        })
+        .map(discord_invite_user_label)
+        .collect()
+}
+
+fn allowed_discord_user_rows(settings: &DiscordBridgeSettings) -> Vec<AllowedDiscordUserRow> {
+    discord_bridge::allowed_requester_ids(&settings.allowed_requester_ids)
+        .into_iter()
+        .map(|discord_user_id| {
+            let display_name = settings
+                .allowed_requesters
+                .iter()
+                .find(|requester| requester.discord_user_id == discord_user_id)
+                .map(|requester| requester.display_name.trim())
+                .filter(|display_name| !display_name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| "Unknown user".to_owned());
+
+            AllowedDiscordUserRow {
+                discord_user_id,
+                display_name,
+            }
+        })
+        .collect()
+}
+
+fn local_datetime_from_unix(timestamp: i64) -> Option<DateTime<Local>> {
+    DateTime::<Utc>::from_timestamp(timestamp, 0).map(|value| value.with_timezone(&Local))
+}
+
+fn alarm_label_from_text(value: &str) -> String {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        "Alarm".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn blank_lockfile_override_is_ignored() {
@@ -1613,6 +2442,131 @@ mod tests {
     fn detected_games_overflow_starts_after_inline_limit() {
         assert_eq!(detected_games_overflow_count(4), None);
         assert_eq!(detected_games_overflow_count(5), Some(1));
+    }
+
+    #[test]
+    fn allowed_discord_user_rows_use_labels_when_available() {
+        let mut settings = DiscordBridgeSettings::default();
+        settings.allowed_requester_ids = "333\n222".to_owned();
+        settings
+            .allowed_requesters
+            .push(discord_bridge::AllowedDiscordRequester {
+                discord_user_id: "222".to_owned(),
+                display_name: "Jane".to_owned(),
+            });
+
+        assert_eq!(
+            allowed_discord_user_rows(&settings),
+            vec![
+                AllowedDiscordUserRow {
+                    discord_user_id: "222".to_owned(),
+                    display_name: "Jane".to_owned(),
+                },
+                AllowedDiscordUserRow {
+                    discord_user_id: "333".to_owned(),
+                    display_name: "Unknown user".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn paired_discord_account_label_prefers_name_with_id() {
+        let mut settings = DiscordBridgeSettings {
+            paired_discord_user_id: Some("123".to_owned()),
+            paired_discord_user_label: Some("Zyhler".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(paired_discord_account_label(&settings), "Zyhler (ID: 123)");
+
+        settings.paired_discord_user_label = None;
+
+        assert_eq!(paired_discord_account_label(&settings), "ID: 123");
+    }
+
+    #[test]
+    fn pairing_code_is_only_visible_while_unpaired_and_unexpired() {
+        let now = Local.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let mut settings = DiscordBridgeSettings {
+            pairing_code: "ABCD-1234".to_owned(),
+            pairing_expires_at: Some(now + chrono::Duration::minutes(5)),
+            ..Default::default()
+        };
+
+        assert_eq!(visible_pairing_code(&settings, now), Some("ABCD-1234"));
+
+        settings.paired_discord_user_id = Some("123".to_owned());
+        assert_eq!(visible_pairing_code(&settings, now), None);
+
+        settings.paired_discord_user_id = None;
+        settings.pairing_expires_at = Some(now - chrono::Duration::seconds(1));
+        assert_eq!(visible_pairing_code(&settings, now), None);
+    }
+
+    #[test]
+    fn inactive_pairing_code_is_cleared_from_state() {
+        let now = Local.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
+        let mut settings = DiscordBridgeSettings {
+            pairing_code: "ABCD-1234".to_owned(),
+            pairing_expires_at: Some(now + chrono::Duration::minutes(5)),
+            paired_discord_user_id: Some("123".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(clear_inactive_pairing_code(&mut settings, now));
+        assert!(settings.pairing_code.is_empty());
+        assert_eq!(settings.pairing_expires_at, None);
+
+        assert!(!clear_inactive_pairing_code(&mut settings, now));
+    }
+
+    #[test]
+    fn new_companion_invite_labels_only_returns_unseen_invites() {
+        let existing = vec![CompanionInvite {
+            id: 1,
+            owner_id: "111".to_owned(),
+            invitee_id: "222".to_owned(),
+            invitee_label: "Jane".to_owned(),
+            created_at_unix: 1,
+            expires_at_unix: 2,
+        }];
+        let incoming = vec![
+            CompanionInvite {
+                id: 1,
+                owner_id: "111".to_owned(),
+                invitee_id: "222".to_owned(),
+                invitee_label: "Jane".to_owned(),
+                created_at_unix: 1,
+                expires_at_unix: 2,
+            },
+            CompanionInvite {
+                id: 2,
+                owner_id: "111".to_owned(),
+                invitee_id: "333".to_owned(),
+                invitee_label: String::new(),
+                created_at_unix: 3,
+                expires_at_unix: 4,
+            },
+        ];
+
+        assert_eq!(
+            new_companion_invite_labels(&existing, &incoming),
+            vec!["<@333>".to_owned()]
+        );
+    }
+
+    #[test]
+    fn blank_alarm_label_defaults_to_alarm() {
+        assert_eq!(alarm_label_from_text("   "), "Alarm");
+        assert_eq!(alarm_label_from_text(" Laundry "), "Laundry");
+    }
+
+    #[test]
+    fn alarm_list_datetime_uses_time_then_european_date() {
+        let value = Local.with_ymd_and_hms(2026, 9, 1, 7, 5, 30).unwrap();
+
+        assert_eq!(format_alarm_list_datetime(value), "07:05 01-09-2026");
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod alarm;
 pub mod app;
 pub mod counter_strike;
 pub mod crash;
+pub mod discord_bridge;
 pub mod game;
 pub mod league;
 pub mod notifier;
