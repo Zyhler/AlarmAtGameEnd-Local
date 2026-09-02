@@ -745,6 +745,10 @@ impl AlarmApp {
             return;
         }
 
+        if remember_requester_label_from_request(&mut self.state.discord_bridge, &request) {
+            self.persist_current_state();
+        }
+
         match self
             .schedule_alarm_from_values(alarm_label_from_text(&request.label), request.time_text())
         {
@@ -2370,6 +2374,25 @@ fn new_companion_invite_labels(
         .collect()
 }
 
+fn remember_requester_label_from_request(
+    settings: &mut DiscordBridgeSettings,
+    request: &RemoteDiscordAlarmRequest,
+) -> bool {
+    let Some(display_name) = request
+        .requester_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|display_name| !display_name.is_empty())
+    else {
+        return false;
+    };
+
+    let previous_requesters = settings.allowed_requesters.clone();
+    discord_bridge::remember_allowed_requester(settings, &request.requester_id, display_name);
+
+    settings.allowed_requesters != previous_requesters
+}
+
 fn allowed_discord_user_rows(settings: &DiscordBridgeSettings) -> Vec<AllowedDiscordUserRow> {
     discord_bridge::allowed_requester_ids(&settings.allowed_requester_ids)
         .into_iter()
@@ -2467,6 +2490,65 @@ mod tests {
                     display_name: "Unknown user".to_owned(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn requester_label_from_remote_request_updates_allowed_user_row() {
+        let mut settings = DiscordBridgeSettings::default();
+        settings.allowed_requester_ids = "222".to_owned();
+        let request = RemoteDiscordAlarmRequest {
+            id: 1,
+            requester_id: "222".to_owned(),
+            requester_label: Some("Jane".to_owned()),
+            target_id: "111".to_owned(),
+            hour: 7,
+            minute: 5,
+            label: "Laundry".to_owned(),
+            created_at_unix: 1,
+            expires_at_unix: 2,
+        };
+
+        assert!(remember_requester_label_from_request(
+            &mut settings,
+            &request
+        ));
+        assert_eq!(
+            allowed_discord_user_rows(&settings),
+            vec![AllowedDiscordUserRow {
+                discord_user_id: "222".to_owned(),
+                display_name: "Jane".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn blank_requester_label_does_not_overwrite_known_allowed_user_name() {
+        let mut settings = DiscordBridgeSettings::default();
+        settings.allowed_requester_ids = "222".to_owned();
+        discord_bridge::remember_allowed_requester(&mut settings, "222", "Jane");
+        let request = RemoteDiscordAlarmRequest {
+            id: 1,
+            requester_id: "222".to_owned(),
+            requester_label: Some("   ".to_owned()),
+            target_id: "111".to_owned(),
+            hour: 7,
+            minute: 5,
+            label: "Laundry".to_owned(),
+            created_at_unix: 1,
+            expires_at_unix: 2,
+        };
+
+        assert!(!remember_requester_label_from_request(
+            &mut settings,
+            &request
+        ));
+        assert_eq!(
+            allowed_discord_user_rows(&settings),
+            vec![AllowedDiscordUserRow {
+                discord_user_id: "222".to_owned(),
+                display_name: "Jane".to_owned(),
+            }]
         );
     }
 

@@ -3,17 +3,22 @@ use chrono::{DateTime, Local};
 use rand::RngCore;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::time::Duration;
 use thiserror::Error;
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_BRIDGE_URL: &str = "https://aagedb.zyhlerservers.ddns.net";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DiscordBridgeSettings {
+    #[serde(
+        default = "default_bridge_url",
+        deserialize_with = "deserialize_bridge_url"
+    )]
     pub bridge_url: String,
     pub companion_id: String,
     pub api_token: String,
@@ -37,7 +42,7 @@ pub struct AllowedDiscordRequester {
 impl Default for DiscordBridgeSettings {
     fn default() -> Self {
         Self {
-            bridge_url: String::new(),
+            bridge_url: default_bridge_url(),
             companion_id: String::new(),
             api_token: String::new(),
             pairing_code: String::new(),
@@ -48,6 +53,23 @@ impl Default for DiscordBridgeSettings {
             allowed_requesters: Vec::new(),
             poll_enabled: false,
         }
+    }
+}
+
+fn default_bridge_url() -> String {
+    DEFAULT_BRIDGE_URL.to_owned()
+}
+
+fn deserialize_bridge_url<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let bridge_url = String::deserialize(deserializer)?;
+
+    if bridge_url.trim().is_empty() {
+        Ok(default_bridge_url())
+    } else {
+        Ok(bridge_url)
     }
 }
 
@@ -121,6 +143,13 @@ pub struct PollRequestsResponse {
 pub struct RemoteAlarmRequest {
     pub id: u64,
     pub requester_id: String,
+    #[serde(
+        default,
+        alias = "requester_display_name",
+        alias = "requester_name",
+        alias = "requesterDisplayName"
+    )]
+    pub requester_label: Option<String>,
     pub target_id: String,
     pub hour: u8,
     pub minute: u8,
@@ -465,6 +494,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_bridge_url_points_to_configured_server() {
+        assert_eq!(
+            DiscordBridgeSettings::default().bridge_url,
+            DEFAULT_BRIDGE_URL
+        );
+    }
+
+    #[test]
+    fn saved_bridge_settings_without_url_use_default_bridge_url() {
+        let settings: DiscordBridgeSettings = serde_json::from_str(
+            r#"{
+                "companion_id": "",
+                "api_token": "",
+                "pairing_code": "",
+                "pairing_expires_at": null,
+                "paired_discord_user_id": null,
+                "allowed_requester_ids": "",
+                "poll_enabled": false
+            }"#,
+        )
+        .expect("bridge settings should parse");
+
+        assert_eq!(settings.bridge_url, DEFAULT_BRIDGE_URL);
+    }
+
+    #[test]
+    fn saved_bridge_settings_with_blank_url_use_default_bridge_url() {
+        let settings: DiscordBridgeSettings = serde_json::from_str(
+            r#"{
+                "bridge_url": "   ",
+                "companion_id": "",
+                "api_token": "",
+                "pairing_code": "",
+                "pairing_expires_at": null,
+                "paired_discord_user_id": null,
+                "allowed_requester_ids": "",
+                "poll_enabled": false
+            }"#,
+        )
+        .expect("bridge settings should parse");
+
+        assert_eq!(settings.bridge_url, DEFAULT_BRIDGE_URL);
+    }
+
+    #[test]
+    fn saved_bridge_settings_keep_custom_bridge_url() {
+        let settings: DiscordBridgeSettings = serde_json::from_str(
+            r#"{
+                "bridge_url": "http://127.0.0.1:3000",
+                "companion_id": "",
+                "api_token": "",
+                "pairing_code": "",
+                "pairing_expires_at": null,
+                "paired_discord_user_id": null,
+                "allowed_requester_ids": "",
+                "poll_enabled": false
+            }"#,
+        )
+        .expect("bridge settings should parse");
+
+        assert_eq!(settings.bridge_url, "http://127.0.0.1:3000");
+    }
+
+    #[test]
     fn ensure_credentials_only_generates_missing_values() {
         let mut settings = DiscordBridgeSettings::default();
 
@@ -554,6 +647,7 @@ mod tests {
         let request = RemoteAlarmRequest {
             id: 1,
             requester_id: "111".to_owned(),
+            requester_label: None,
             target_id: "222".to_owned(),
             hour: 7,
             minute: 5,
@@ -563,5 +657,25 @@ mod tests {
         };
 
         assert_eq!(request.time_text(), "07.05");
+    }
+
+    #[test]
+    fn remote_alarm_request_accepts_optional_requester_label() {
+        let request: RemoteAlarmRequest = serde_json::from_str(
+            r#"{
+                "id": 1,
+                "requester_id": "111",
+                "requester_label": "Jane",
+                "target_id": "222",
+                "hour": 7,
+                "minute": 5,
+                "label": "Laundry",
+                "created_at_unix": 1,
+                "expires_at_unix": 2
+            }"#,
+        )
+        .expect("remote alarm request should parse");
+
+        assert_eq!(request.requester_label.as_deref(), Some("Jane"));
     }
 }
