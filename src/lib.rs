@@ -12,6 +12,7 @@ pub mod theme;
 pub mod worker;
 
 pub const APP_NAME: &str = "Alarm at Game End";
+const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 pub fn run() -> eframe::Result {
     let native_options = native_options_from_saved_state();
@@ -25,12 +26,24 @@ pub fn run() -> eframe::Result {
 
 fn native_options_from_saved_state() -> eframe::NativeOptions {
     let mut native_options = eframe::NativeOptions::default();
+    apply_app_icon(&mut native_options);
 
     if let Ok(state) = storage::load_state() {
         apply_graphics_backend_preference(&mut native_options, state.graphics_backend_preference);
     }
 
     native_options
+}
+
+fn apply_app_icon(native_options: &mut eframe::NativeOptions) {
+    match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
+        Ok(icon) => {
+            native_options.viewport = native_options.viewport.clone().with_icon(icon);
+        }
+        Err(error) => {
+            eprintln!("could not load app icon: {error}");
+        }
+    }
 }
 
 pub fn graphics_backend_renderer(
