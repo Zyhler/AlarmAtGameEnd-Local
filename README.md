@@ -26,5 +26,4 @@ If game detection is unavailable when an alarm is due, the alarm fires instead o
 
 ## Plans
 
-Have discord Bot integration - in progress
 Add more games.
