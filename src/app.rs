@@ -12,7 +12,7 @@ use crate::discord_bridge::{
 };
 use crate::game::{GameDetectionConfig, GameStatus};
 use crate::league::GAME_NAME as LEAGUE_OF_LEGENDS_GAME_NAME;
-use crate::sound::{SoundHandle, sound_path_from_text};
+use crate::sound::{SoundHandle, SoundPlaybackSettings, sound_path_from_text};
 use crate::storage::{
     self, PersistedGraphicsBackendPreference, PersistedLogEntry, PersistedLogLevel, PersistedState,
     PersistedThemePreference,
@@ -29,6 +29,14 @@ const INLINE_DETECTED_GAME_LIMIT: usize = 4;
 const IDLE_REPAINT_INTERVAL: Duration = Duration::from_millis(1000);
 const ACCENT_BUTTON_PRESSED_SHRINK: f32 = 1.0;
 const MAX_LOG_ENTRIES: usize = 500;
+const PAGE_ROW_SPACING_Y: f32 = 8.0;
+const PAGE_CONTROL_HEIGHT: f32 = 32.0;
+const MAX_APP_NOTICES: usize = 3;
+const APP_NOTICE_TTL: Duration = Duration::from_secs(4);
+const APP_NOTICE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+const APP_NOTICE_WIDTH: f32 = 340.0;
+const ALARM_VOLUME_SLIDER_WIDTH: f32 = 240.0;
+const ALARM_VOLUME_VALUE_WIDTH: f32 = 56.0;
 
 pub struct AlarmApp {
     state: PersistedState,
@@ -39,6 +47,7 @@ pub struct AlarmApp {
     next_alarm_popup_id: u64,
     test_sound: Option<SoundHandle>,
     logs: Vec<LogEntry>,
+    app_notices: Vec<AppNotice>,
     current_page: AppPage,
     accent_color: egui::Color32,
     bridge_registration: Option<Receiver<Result<PairingRegistrationResponse, String>>>,
@@ -88,6 +97,13 @@ struct LogEntry {
     message: String,
 }
 
+#[derive(Clone, Debug)]
+struct AppNotice {
+    level: LogLevel,
+    message: String,
+    created_at: Instant,
+}
+
 #[derive(Debug)]
 struct AlarmPopup {
     id: u64,
@@ -104,6 +120,26 @@ impl AlarmPopup {
             sound.stop();
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AlarmPopupPalette {
+    shell_fill: egui::Color32,
+    card_fill: egui::Color32,
+    border: egui::Color32,
+    accent: egui::Color32,
+    title: egui::Color32,
+    body: egui::Color32,
+    muted: egui::Color32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AppNoticePalette {
+    fill: egui::Color32,
+    border: egui::Color32,
+    accent: egui::Color32,
+    title: egui::Color32,
+    body: egui::Color32,
 }
 
 impl AlarmApp {
@@ -135,6 +171,7 @@ impl AlarmApp {
 
         let monitor = MonitorHandle::spawn(
             game_detection_config_from_state(&state),
+            sound_playback_settings_from_state(&state),
             restored_alarms.clone(),
         );
 
@@ -151,6 +188,7 @@ impl AlarmApp {
             next_alarm_popup_id: 1,
             test_sound: None,
             logs,
+            app_notices: Vec::new(),
             current_page: AppPage::Alarm,
             accent_color,
             bridge_registration: None,
@@ -329,6 +367,45 @@ impl AlarmApp {
         self.log_at(LogLevel::Error, Local::now(), message);
     }
 
+    fn notify_info(&mut self, message: impl Into<String>) {
+        self.notify(LogLevel::Info, message);
+    }
+
+    fn notify_error(&mut self, message: impl Into<String>) {
+        self.notify(LogLevel::Error, message);
+    }
+
+    fn notify(&mut self, level: LogLevel, message: impl Into<String>) {
+        let message = message.into();
+        self.push_app_notice(level, message.clone());
+        self.log_at(level, Local::now(), message);
+    }
+
+    fn show_app_notice(&mut self, level: LogLevel, message: impl Into<String>) {
+        self.push_app_notice(level, message);
+    }
+
+    fn push_app_notice(&mut self, level: LogLevel, message: impl Into<String>) {
+        self.app_notices.push(AppNotice {
+            level,
+            message: message.into(),
+            created_at: Instant::now(),
+        });
+
+        if self.app_notices.len() > MAX_APP_NOTICES {
+            let overflow_count = self.app_notices.len() - MAX_APP_NOTICES;
+            self.app_notices.drain(..overflow_count);
+        }
+    }
+
+    fn clear_expired_app_notices(&mut self) -> bool {
+        let previous_len = self.app_notices.len();
+        self.app_notices
+            .retain(|notice| notice.created_at.elapsed() < APP_NOTICE_TTL);
+
+        self.app_notices.len() != previous_len
+    }
+
     fn log_at(
         &mut self,
         level: LogLevel,
@@ -392,7 +469,7 @@ impl AlarmApp {
 
     fn schedule_alarm(&mut self) {
         if let Err(error) = self.normalize_alarm_time_field() {
-            self.log_error(error.to_string());
+            self.notify_error(error.to_string());
             return;
         }
 
@@ -400,13 +477,13 @@ impl AlarmApp {
 
         match self.schedule_alarm_from_values(label, self.state.alarm_time.clone()) {
             Ok(scheduled_for) => {
-                self.log_info(format!(
+                self.notify_info(format!(
                     "Alarm added for {}",
                     format_datetime(scheduled_for)
                 ));
             }
             Err(error) => {
-                self.log_error(error.to_string());
+                self.notify_error(error.to_string());
             }
         }
     }
@@ -444,8 +521,15 @@ impl AlarmApp {
         self.monitor.send(MonitorCommand::SetGameDetectionConfig(
             game_detection_config_from_state(&self.state),
         ));
+        self.apply_sound_playback_settings();
 
         self.persist_current_state()
+    }
+
+    fn apply_sound_playback_settings(&self) {
+        self.monitor.send(MonitorCommand::SetSoundPlaybackSettings(
+            sound_playback_settings_from_state(&self.state),
+        ));
     }
 
     fn install_counter_strike_2_gsi_config(&mut self) {
@@ -457,15 +541,15 @@ impl AlarmApp {
                 ) {
                     Ok(()) => {
                         self.save_settings();
-                        self.log_info(format!("CS2 GSI config installed at {}", path.display()));
+                        self.notify_info(format!("CS2 GSI config installed at {}", path.display()));
                     }
                     Err(error) => {
-                        self.log_error(error.to_string());
+                        self.notify_error(error.to_string());
                     }
                 }
             }
             None => {
-                self.log_error("CS2 GSI config path is blank");
+                self.notify_error("CS2 GSI config path is blank");
             }
         }
     }
@@ -473,6 +557,7 @@ impl AlarmApp {
     fn start_bridge_pairing(&mut self) {
         if self.bridge_registration.is_some() {
             self.set_bridge_status("Pairing registration already in progress");
+            self.show_app_notice(LogLevel::Info, "Pairing registration already in progress");
             return;
         }
 
@@ -484,11 +569,15 @@ impl AlarmApp {
             .is_some_and(|user_id| !user_id.trim().is_empty())
         {
             self.set_bridge_status("Clear pairing before generating a new code");
+            self.show_app_notice(
+                LogLevel::Error,
+                "Clear pairing before generating a new code",
+            );
             return;
         }
 
         if self.state.discord_bridge.bridge_url.trim().is_empty() {
-            self.log_error("Discord bridge URL is blank");
+            self.notify_error("Discord bridge URL is blank");
             return;
         }
 
@@ -505,7 +594,7 @@ impl AlarmApp {
         let config = match self.state.discord_bridge.client_config() {
             Ok(config) => config,
             Err(error) => {
-                self.log_error(format!("Discord bridge is not ready: {error}"));
+                self.notify_error(format!("Discord bridge is not ready: {error}"));
                 return;
             }
         };
@@ -519,6 +608,7 @@ impl AlarmApp {
 
         self.bridge_registration = Some(receiver);
         self.set_bridge_status("Registering pairing code");
+        self.show_app_notice(LogLevel::Info, "Generating pairing code");
     }
 
     fn clear_bridge_pairing(&mut self) {
@@ -535,6 +625,7 @@ impl AlarmApp {
         self.pending_companion_invites.clear();
         self.persist_current_state();
         self.set_bridge_status("Disconnected");
+        self.notify_info("Discord pairing cleared");
     }
 
     fn clear_inactive_bridge_pairing_code(&mut self) -> bool {
@@ -574,7 +665,7 @@ impl AlarmApp {
                     self.state.discord_bridge.pairing_expires_at =
                         local_datetime_from_unix(response.expires_at_unix);
                     self.persist_current_state();
-                    self.log_info("Discord pairing code registered");
+                    self.notify_info("Discord pairing code registered");
                     self.set_bridge_status("Waiting for /companion pair");
                     self.next_bridge_poll_at = Instant::now();
                 }
@@ -582,7 +673,7 @@ impl AlarmApp {
                     self.state.discord_bridge.pairing_code.clear();
                     self.state.discord_bridge.pairing_expires_at = None;
                     self.persist_current_state();
-                    self.log_error(format!("Could not register Discord pairing code: {error}"));
+                    self.notify_error(format!("Could not register Discord pairing code: {error}"));
                     self.set_bridge_status("Pairing failed");
                 }
             }
@@ -818,7 +909,7 @@ impl AlarmApp {
             .retain(|invite| invite.id != invite_id);
         self.persist_current_state();
         self.report_bridge_invite_status(invite_id, InviteStatus::Allowed);
-        self.log_info(format!(
+        self.notify_info(format!(
             "Allowed {} to request alarms",
             discord_invite_user_label(&invite)
         ));
@@ -837,7 +928,7 @@ impl AlarmApp {
         self.pending_companion_invites
             .retain(|invite| invite.id != invite_id);
         self.report_bridge_invite_status(invite_id, InviteStatus::Rejected);
-        self.log_info(format!(
+        self.notify_info(format!(
             "Rejected Discord access invite for {}",
             discord_invite_user_label(&invite)
         ));
@@ -857,34 +948,32 @@ impl AlarmApp {
         let input = self.new_allowed_requester_id.trim().to_owned();
 
         if input.is_empty() {
-            self.log_error("Allowed Discord user field is blank");
+            self.notify_error("Enter a Discord user ID before clicking Add");
             return;
         }
+
+        let Some(added_id) = discord_bridge::normalize_allowed_requester_id(&input) else {
+            self.notify_error(
+                "Could not add that Discord user. Use a numeric Discord ID or copied @mention; usernames alone do not work here.",
+            );
+            return;
+        };
 
         let previous_ids =
             discord_bridge::allowed_requester_ids(&self.state.discord_bridge.allowed_requester_ids);
-        let updated_ids = discord_bridge::add_allowed_requester(
-            &self.state.discord_bridge.allowed_requester_ids,
-            &input,
-        );
-        let next_ids = discord_bridge::allowed_requester_ids(&updated_ids);
-
-        if next_ids == previous_ids {
-            self.log_error("Discord user is already allowed or the ID is invalid");
+        if previous_ids.iter().any(|id| id == &added_id) {
+            self.notify_info(format!("Discord user {added_id} is already allowed"));
             return;
         }
 
-        let added_id = next_ids
-            .iter()
-            .find(|id| !previous_ids.contains(id))
-            .cloned()
-            .unwrap_or_else(|| input.clone());
-
-        self.state.discord_bridge.allowed_requester_ids = updated_ids;
+        self.state.discord_bridge.allowed_requester_ids = discord_bridge::add_allowed_requester(
+            &self.state.discord_bridge.allowed_requester_ids,
+            &added_id,
+        );
         discord_bridge::remember_allowed_requester(&mut self.state.discord_bridge, &added_id, "");
         self.new_allowed_requester_id.clear();
         self.persist_current_state();
-        self.log_info(format!("Allowed Discord user {added_id} to request alarms"));
+        self.notify_info(format!("Allowed Discord user {added_id} to request alarms"));
     }
 
     fn remove_allowed_requester(&mut self, user_id: &str) {
@@ -894,7 +983,7 @@ impl AlarmApp {
         );
         discord_bridge::forget_allowed_requester(&mut self.state.discord_bridge, user_id);
         self.persist_current_state();
-        self.log_info(format!("Removed Discord user {user_id} from allowed users"));
+        self.notify_info(format!("Removed Discord user {user_id} from allowed users"));
     }
 
     fn remember_bridge_request_id(&mut self, request_id: u64) {
@@ -970,11 +1059,12 @@ impl AlarmApp {
                 ui.end_row();
 
                 for pending_alarm in alarms {
-                    ui.label(format_alarm_list_datetime(
-                        pending_alarm.alarm.scheduled_for,
-                    ));
-                    ui.label(&pending_alarm.alarm.label);
-                    ui.label(pending_alarm.status.as_str());
+                    copyable_label(
+                        ui,
+                        format_alarm_list_datetime(pending_alarm.alarm.scheduled_for),
+                    );
+                    copyable_label(ui, pending_alarm.alarm.label.clone());
+                    copyable_label(ui, pending_alarm.status.as_str());
 
                     if accent_button(ui, "Cancel", self.accent_color).clicked() {
                         self.monitor
@@ -984,7 +1074,7 @@ impl AlarmApp {
                             .alarms
                             .retain(|alarm| alarm.id != pending_alarm.id);
                         refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
-                        self.log_info(format!("Alarm cancelled: {}", pending_alarm.alarm.label));
+                        self.notify_info(format!("Alarm cancelled: {}", pending_alarm.alarm.label));
                     }
 
                     ui.end_row();
@@ -1049,11 +1139,11 @@ impl AlarmApp {
             .striped(true)
             .show(ui, |ui| {
                 ui.label("Alarm");
-                ui.label(self.alarm_status_label());
+                copyable_label(ui, self.alarm_status_label());
                 ui.end_row();
 
                 ui.label("Label");
-                ui.label(self.alarm_summary());
+                copyable_label(ui, self.alarm_summary());
                 ui.end_row();
 
                 ui.label("Detected games");
@@ -1061,7 +1151,7 @@ impl AlarmApp {
                 ui.end_row();
 
                 ui.label("Checked");
-                ui.label(format_datetime(self.snapshot.last_checked));
+                copyable_label(ui, format_datetime(self.snapshot.last_checked));
                 ui.end_row();
             });
     }
@@ -1138,7 +1228,7 @@ impl AlarmApp {
                 self.snapshot.alarm.fired_at = None;
                 self.snapshot.alarm.last_fired_label = None;
                 refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
-                self.log_info("All alarms cancelled");
+                self.notify_info("All alarms cancelled");
             }
         });
 
@@ -1181,12 +1271,44 @@ impl AlarmApp {
         );
 
         ui.horizontal(|ui| {
+            ui.label("Alarm volume");
+            let mut volume_percent = i32::from(clamped_sound_volume_percent(
+                self.state.sound_volume_percent,
+            ));
+            let response = alarm_volume_control(ui, self.accent_color, &mut volume_percent);
+
+            if response.changed() {
+                self.state.sound_volume_percent = volume_percent.clamp(0, 100) as u8;
+                self.persist_current_state();
+                self.apply_sound_playback_settings();
+            }
+        });
+
+        if readable_checkbox(
+            ui,
+            &mut self.state.sound_fade_in,
+            self.accent_color,
+            "Fade in alarm sound",
+        )
+        .changed()
+        {
+            self.persist_current_state();
+            self.apply_sound_playback_settings();
+        }
+        ui.label(
+            egui::RichText::new(
+                "Fade-in gradually raises volume for the first 5 seconds. It does a little extra work while the sound starts; leave it off on slow PCs if audio stutters.",
+            )
+            .color(crate::theme::muted_text_color(ui.visuals())),
+        );
+
+        ui.horizontal(|ui| {
             if accent_button(ui, "Test Alarm Popup", self.accent_color).clicked() {
                 if let Some(sound) = self.test_sound.take() {
                     sound.stop();
                 }
 
-                self.log_info("Starting test alarm popup");
+                self.notify_info("Starting test alarm popup");
                 self.monitor
                     .send(MonitorCommand::TestAlarmPopup(sound_path_from_text(
                         &self.state.sound_path,
@@ -1198,7 +1320,7 @@ impl AlarmApp {
                     sound.stop();
                 }
 
-                self.log_info("Starting test sound");
+                self.notify_info("Starting test sound");
                 self.monitor
                     .send(MonitorCommand::TestSound(sound_path_from_text(
                         &self.state.sound_path,
@@ -1212,13 +1334,17 @@ impl AlarmApp {
                     sound.stop();
                 }
 
-                self.log_info("Test sound stopped");
+                self.notify_info("Test sound stopped");
             }
         });
 
         ui.separator();
-        if accent_button(ui, "Save Settings", self.accent_color).clicked() && self.save_settings() {
-            self.log_info("Settings saved");
+        if accent_button(ui, "Save Settings", self.accent_color).clicked() {
+            if self.save_settings() {
+                self.notify_info("Settings saved");
+            } else {
+                self.show_app_notice(LogLevel::Error, "Could not save settings");
+            }
         }
     }
 
@@ -1246,7 +1372,7 @@ impl AlarmApp {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Status");
-            ui.label(&self.bridge_status);
+            copyable_label(ui, self.bridge_status.clone());
         });
 
         ui.separator();
@@ -1262,20 +1388,31 @@ impl AlarmApp {
             }
         });
 
-        if let Some(pairing_code) = visible_pairing_code(&self.state.discord_bridge, Local::now()) {
+        if let Some(pairing_code) =
+            visible_pairing_code(&self.state.discord_bridge, Local::now()).map(str::to_owned)
+        {
             ui.horizontal(|ui| {
                 ui.label("Pairing code");
-                ui.strong(pairing_code);
+                copyable_monospace_label(ui, pairing_code.clone());
+
+                if accent_button(ui, "Copy", self.accent_color).clicked() {
+                    copy_to_clipboard(ui.ctx(), pairing_code.clone());
+                    self.show_app_notice(LogLevel::Info, "Pairing code copied to clipboard");
+                    self.set_bridge_status("Pairing code copied to clipboard");
+                }
             });
 
             if let Some(expires_at) = self.state.discord_bridge.pairing_expires_at {
-                ui.label(format!("Expires {}", format_expiry_datetime(expires_at)));
+                copyable_label(
+                    ui,
+                    format!("Expires {}", format_expiry_datetime(expires_at)),
+                );
             }
         }
 
         ui.horizontal(|ui| {
             ui.label("Paired account");
-            ui.label(paired_discord_account_label(&self.state.discord_bridge));
+            copyable_label(ui, paired_discord_account_label(&self.state.discord_bridge));
         });
 
         self.draw_pending_companion_invites(ui);
@@ -1302,8 +1439,8 @@ impl AlarmApp {
                     ui.end_row();
 
                     for user in &users {
-                        ui.label(&user.display_name);
-                        ui.monospace(&user.discord_user_id);
+                        copyable_label(ui, user.display_name.clone());
+                        copyable_monospace_label(ui, user.discord_user_id.clone());
 
                         if accent_button(ui, "Remove", self.accent_color).clicked() {
                             remove_user_id = Some(user.discord_user_id.clone());
@@ -1321,18 +1458,18 @@ impl AlarmApp {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label("Add by ID");
-            let input_height = ui.spacing().interact_size.y;
+            let input_height = row_control_height(ui);
             text_input_with_min_height(
                 ui,
                 self.accent_color,
                 "discord_new_allowed_requester_id",
                 &mut self.new_allowed_requester_id,
                 260.0,
-                "Discord ID or mention",
+                "Discord ID (numbers)",
                 input_height,
             );
 
-            if accent_button(ui, "Add", self.accent_color).clicked() {
+            if accent_button_with_min_height(ui, "Add", self.accent_color, input_height).clicked() {
                 self.add_allowed_requester_from_input();
             }
         });
@@ -1351,10 +1488,13 @@ impl AlarmApp {
             ui.group(|ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(format!(
-                        "Allow {} to request alarms",
-                        discord_invite_user_label(&invite)
-                    ));
+                    copyable_label(
+                        ui,
+                        format!(
+                            "Allow {} to request alarms",
+                            discord_invite_user_label(&invite)
+                        ),
+                    );
 
                     if accent_button(ui, "Allow", self.accent_color).clicked() {
                         self.allow_companion_invite(invite.id);
@@ -1366,7 +1506,10 @@ impl AlarmApp {
                 });
 
                 if let Some(expires_at) = local_datetime_from_unix(invite.expires_at_unix) {
-                    ui.label(format!("Expires {}", format_expiry_datetime(expires_at)));
+                    copyable_label(
+                        ui,
+                        format!("Expires {}", format_expiry_datetime(expires_at)),
+                    );
                 }
             });
         }
@@ -1441,10 +1584,12 @@ impl AlarmApp {
         self.draw_counter_strike_2_game_section(ui);
 
         ui.separator();
-        if accent_button(ui, "Save Game Settings", self.accent_color).clicked()
-            && self.save_settings()
-        {
-            self.log_info("Game settings saved");
+        if accent_button(ui, "Save Game Settings", self.accent_color).clicked() {
+            if self.save_settings() {
+                self.notify_info("Game settings saved");
+            } else {
+                self.show_app_notice(LogLevel::Error, "Could not save game settings");
+            }
         }
     }
 
@@ -1456,6 +1601,7 @@ impl AlarmApp {
                 if accent_button(ui, "Clear", self.accent_color).clicked() {
                     self.logs.clear();
                     self.persist_current_state();
+                    self.show_app_notice(LogLevel::Info, "Log cleared");
                 }
             });
         });
@@ -1477,9 +1623,14 @@ impl AlarmApp {
                 ui.end_row();
 
                 for entry in self.logs.iter().rev() {
-                    ui.label(format_datetime(entry.occurred_at));
-                    ui.colored_label(entry.level.color(ui.visuals()), entry.level.as_str());
-                    ui.label(&entry.message);
+                    copyable_label(ui, format_datetime(entry.occurred_at));
+                    copyable_rich_label(
+                        ui,
+                        egui::RichText::new(entry.level.as_str())
+                            .color(entry.level.color(ui.visuals())),
+                        entry.level.as_str(),
+                    );
+                    copyable_label(ui, entry.message.clone());
                     ui.end_row();
                 }
             });
@@ -1576,16 +1727,18 @@ impl AlarmApp {
     }
 
     fn draw_current_page(&mut self, ui: &mut egui::Ui) {
-        self.draw_navigation(ui);
-        ui.separator();
+        with_page_spacing(ui, |ui| {
+            self.draw_navigation(ui);
+            ui.separator();
 
-        match self.current_page {
-            AppPage::Alarm => self.draw_alarm_panel(ui),
-            AppPage::Games => self.draw_games_panel(ui),
-            AppPage::Discord => self.draw_discord_bridge_settings(ui),
-            AppPage::Log => self.draw_log_panel(ui),
-            AppPage::Settings => self.draw_settings_panel(ui),
-        }
+            match self.current_page {
+                AppPage::Alarm => self.draw_alarm_panel(ui),
+                AppPage::Games => self.draw_games_panel(ui),
+                AppPage::Discord => self.draw_discord_bridge_settings(ui),
+                AppPage::Log => self.draw_log_panel(ui),
+                AppPage::Settings => self.draw_settings_panel(ui),
+            }
+        });
     }
 
     fn dismiss_all_alarm_popups(&mut self) {
@@ -1616,45 +1769,121 @@ impl AlarmApp {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(360.0);
+                let shell_palette = alarm_popup_palette(ui.visuals(), false);
 
-                    ui.horizontal(|ui| {
-                        ui.heading("Alarm");
+                egui::Frame::popup(ui.style())
+                    .fill(shell_palette.shell_fill)
+                    .stroke(egui::Stroke::new(1.5, shell_palette.border))
+                    .corner_radius(8)
+                    .show(ui, |ui| {
+                        ui.set_width(360.0);
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if accent_button(ui, "Dismiss all", self.accent_color).clicked() {
-                                dismiss_all = true;
-                            }
+                        ui.horizontal(|ui| {
+                            ui.heading(egui::RichText::new("Alarm").color(shell_palette.title));
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if accent_button(ui, "Dismiss all", self.accent_color).clicked()
+                                    {
+                                        dismiss_all = true;
+                                    }
+                                },
+                            );
                         });
+
+                        ui.separator();
+
+                        for popup in &self.alarm_popups {
+                            let palette = alarm_popup_palette(ui.visuals(), popup.missed);
+                            let response = egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(14, 10))
+                                .outer_margin(egui::Margin::symmetric(0, 4))
+                                .fill(palette.card_fill)
+                                .stroke(egui::Stroke::new(1.25, palette.border))
+                                .corner_radius(8)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+
+                                    if popup.missed {
+                                        ui.label(
+                                            egui::RichText::new("Missed alarm")
+                                                .strong()
+                                                .color(palette.title),
+                                        );
+                                        copyable_rich_label(
+                                            ui,
+                                            egui::RichText::new(popup.label.clone())
+                                                .strong()
+                                                .color(palette.body),
+                                            popup.label.clone(),
+                                        );
+
+                                        let due_text = format!(
+                                            "Was due at {}",
+                                            format_datetime(popup.fired_at)
+                                        );
+                                        copyable_rich_label(
+                                            ui,
+                                            egui::RichText::new(due_text.clone())
+                                                .color(palette.muted),
+                                            due_text,
+                                        );
+                                        copyable_rich_label(
+                                            ui,
+                                            egui::RichText::new("No sound was played.")
+                                                .color(palette.muted),
+                                            "No sound was played.",
+                                        );
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new("Alarm")
+                                                .strong()
+                                                .color(palette.title),
+                                        );
+                                        copyable_rich_label(
+                                            ui,
+                                            egui::RichText::new(popup.label.clone())
+                                                .strong()
+                                                .color(palette.body),
+                                            popup.label.clone(),
+                                        );
+
+                                        let fired_text =
+                                            format!("Fired at {}", format_datetime(popup.fired_at));
+                                        copyable_rich_label(
+                                            ui,
+                                            egui::RichText::new(fired_text.clone())
+                                                .color(palette.muted),
+                                            fired_text,
+                                        );
+                                    }
+
+                                    if popup.delayed_by_game {
+                                        copyable_rich_label(
+                                            ui,
+                                            egui::RichText::new("Delayed until the game ended")
+                                                .color(palette.muted),
+                                            "Delayed until the game ended",
+                                        );
+                                    }
+
+                                    ui.horizontal(|ui| {
+                                        if accent_button(ui, "Dismiss", self.accent_color).clicked()
+                                        {
+                                            dismissed_alarm = Some(popup.id);
+                                        }
+                                    });
+                                })
+                                .response;
+
+                            let stripe_rect = egui::Rect::from_min_max(
+                                response.rect.left_top(),
+                                egui::pos2(response.rect.left() + 5.0, response.rect.bottom()),
+                            );
+                            ui.painter().rect_filled(stripe_rect, 3.0, palette.accent);
+                        }
                     });
-
-                    ui.separator();
-
-                    for popup in &self.alarm_popups {
-                        ui.group(|ui| {
-                            ui.set_width(ui.available_width());
-                            if popup.missed {
-                                ui.strong(format!("Missed alarm: {}", popup.label));
-                                ui.label(format!("Was due at {}", format_datetime(popup.fired_at)));
-                                ui.label("No sound was played.");
-                            } else {
-                                ui.strong(&popup.label);
-                                ui.label(format!("Fired at {}", format_datetime(popup.fired_at)));
-                            }
-
-                            if popup.delayed_by_game {
-                                ui.label("Delayed until the game ended");
-                            }
-
-                            ui.horizontal(|ui| {
-                                if accent_button(ui, "Dismiss", self.accent_color).clicked() {
-                                    dismissed_alarm = Some(popup.id);
-                                }
-                            });
-                        });
-                    }
-                });
             });
 
         if dismiss_all {
@@ -1662,6 +1891,51 @@ impl AlarmApp {
         } else if let Some(id) = dismissed_alarm {
             self.dismiss_alarm_popup(id);
         }
+    }
+
+    fn draw_app_notices(&mut self, ctx: &egui::Context) {
+        if self.app_notices.is_empty() {
+            return;
+        }
+
+        ctx.request_repaint_after(APP_NOTICE_REPAINT_INTERVAL);
+
+        egui::Area::new(egui::Id::new("app_notices"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .show(ctx, |ui| {
+                ui.set_width(APP_NOTICE_WIDTH);
+                ui.spacing_mut().item_spacing.y = 8.0;
+
+                for notice in &self.app_notices {
+                    let palette = app_notice_palette(ui.visuals(), notice.level);
+                    let response = egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .fill(palette.fill)
+                        .stroke(egui::Stroke::new(1.25, palette.border))
+                        .corner_radius(8)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                egui::RichText::new(app_notice_title(notice.level))
+                                    .strong()
+                                    .color(palette.title),
+                            );
+                            copyable_rich_label(
+                                ui,
+                                egui::RichText::new(notice.message.clone()).color(palette.body),
+                                notice.message.clone(),
+                            );
+                        })
+                        .response;
+
+                    let stripe_rect = egui::Rect::from_min_max(
+                        response.rect.left_top(),
+                        egui::pos2(response.rect.left() + 5.0, response.rect.bottom()),
+                    );
+                    ui.painter().rect_filled(stripe_rect, 3.0, palette.accent);
+                }
+            });
     }
 }
 
@@ -1674,7 +1948,8 @@ impl eframe::App for AlarmApp {
         let state_changed = self.drain_monitor_events(ctx)
             | self.clear_finished_test_sound()
             | self.clear_inactive_bridge_pairing_code()
-            | self.drain_bridge_tasks(ctx);
+            | self.drain_bridge_tasks(ctx)
+            | self.clear_expired_app_notices();
         self.maybe_start_bridge_poll();
 
         if state_changed {
@@ -1688,7 +1963,8 @@ impl eframe::App for AlarmApp {
         let state_changed = self.drain_monitor_events(ui.ctx())
             | self.clear_finished_test_sound()
             | self.clear_inactive_bridge_pairing_code()
-            | self.drain_bridge_tasks(ui.ctx());
+            | self.drain_bridge_tasks(ui.ctx())
+            | self.clear_expired_app_notices();
         self.maybe_start_bridge_poll();
 
         if state_changed {
@@ -1700,6 +1976,7 @@ impl eframe::App for AlarmApp {
         });
 
         self.draw_alarm_popups(ui.ctx());
+        self.draw_app_notices(ui.ctx());
     }
 }
 
@@ -1735,6 +2012,17 @@ fn game_detection_config_from_state(state: &PersistedState) -> GameDetectionConf
         league_lockfile_override: lockfile_override_from_text(&state.lockfile_path),
         counter_strike_2_gsi_port: state.counter_strike_2_gsi_port,
     }
+}
+
+fn sound_playback_settings_from_state(state: &PersistedState) -> SoundPlaybackSettings {
+    SoundPlaybackSettings::from_percent(
+        clamped_sound_volume_percent(state.sound_volume_percent),
+        state.sound_fade_in,
+    )
+}
+
+fn clamped_sound_volume_percent(volume_percent: u8) -> u8 {
+    volume_percent.min(100)
 }
 
 fn log_entries_from_persisted(entries: &[PersistedLogEntry]) -> Vec<LogEntry> {
@@ -1961,6 +2249,89 @@ fn detected_games_overflow_count(game_count: usize) -> Option<usize> {
         .filter(|overflow_count| *overflow_count > 0)
 }
 
+fn with_page_spacing<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        let spacing = ui.spacing_mut();
+        spacing.item_spacing.y = spacing.item_spacing.y.max(PAGE_ROW_SPACING_Y);
+        spacing.interact_size.y = spacing.interact_size.y.max(PAGE_CONTROL_HEIGHT);
+        spacing.button_padding.y = spacing.button_padding.y.max(5.0);
+
+        add_contents(ui)
+    })
+    .inner
+}
+
+fn row_control_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y.max(PAGE_CONTROL_HEIGHT)
+}
+
+fn alarm_volume_control(
+    ui: &mut egui::Ui,
+    accent_color: egui::Color32,
+    volume_percent: &mut i32,
+) -> egui::Response {
+    let control_height = row_control_height(ui);
+    let slider_response =
+        framed_alarm_volume_slider(ui, accent_color, volume_percent, control_height);
+    alarm_volume_value_box(ui, accent_color, *volume_percent, control_height);
+    slider_response
+}
+
+fn framed_alarm_volume_slider(
+    ui: &mut egui::Ui,
+    accent_color: egui::Color32,
+    volume_percent: &mut i32,
+    control_height: f32,
+) -> egui::Response {
+    with_input_visuals(ui, accent_color, |ui| {
+        let fill = ui.visuals().widgets.inactive.bg_fill;
+        let stroke = ui.visuals().widgets.inactive.bg_stroke;
+
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 0))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(5)
+            .show(ui, |ui| {
+                ui.set_min_size(egui::vec2(ALARM_VOLUME_SLIDER_WIDTH, control_height));
+                ui.add_sized(
+                    egui::vec2(ALARM_VOLUME_SLIDER_WIDTH, control_height),
+                    egui::Slider::new(volume_percent, 0..=100).show_value(false),
+                )
+            })
+            .inner
+    })
+}
+
+fn alarm_volume_value_box(
+    ui: &mut egui::Ui,
+    accent_color: egui::Color32,
+    volume_percent: i32,
+    control_height: f32,
+) -> egui::Response {
+    with_input_visuals(ui, accent_color, |ui| {
+        let fill = ui.visuals().widgets.inactive.bg_fill;
+        let stroke = ui.visuals().widgets.inactive.bg_stroke;
+        let value_text = format!("{}%", volume_percent.clamp(0, 100));
+
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(0))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(5)
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ALARM_VOLUME_VALUE_WIDTH, control_height),
+                    egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                    |ui| {
+                        ui.label(egui::RichText::new(value_text).monospace());
+                    },
+                );
+            })
+            .response
+    })
+}
+
 fn with_input_visuals<R>(
     ui: &mut egui::Ui,
     accent_color: egui::Color32,
@@ -2124,14 +2495,15 @@ fn accent_button(
     label: &'static str,
     accent_color: egui::Color32,
 ) -> egui::Response {
-    accent_button_with_min_size(ui, label, accent_color, true)
+    let min_height = row_control_height(ui);
+    accent_button_with_min_height(ui, label, accent_color, min_height)
 }
 
-fn accent_button_with_min_size(
+fn accent_button_with_min_height(
     ui: &mut egui::Ui,
     label: &'static str,
     accent_color: egui::Color32,
-    use_min_height: bool,
+    min_height: f32,
 ) -> egui::Response {
     ui.scope(|ui| {
         let dark_mode = ui.visuals().dark_mode;
@@ -2153,14 +2525,125 @@ fn accent_button_with_min_size(
         visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_color);
         visuals.widgets.active.expansion = -ACCENT_BUTTON_PRESSED_SHRINK;
 
-        let mut button = egui::Button::new(label);
-        if use_min_height {
-            button = button.min_size(egui::vec2(0.0, ui.spacing().interact_size.y));
-        }
-
+        let button = egui::Button::new(label).min_size(egui::vec2(0.0, min_height));
         ui.add(button)
     })
     .inner
+}
+
+fn alarm_popup_palette(visuals: &egui::Visuals, missed: bool) -> AlarmPopupPalette {
+    match (visuals.dark_mode, missed) {
+        (true, false) => AlarmPopupPalette {
+            shell_fill: egui::Color32::from_rgb(36, 28, 26),
+            card_fill: egui::Color32::from_rgb(47, 34, 31),
+            border: egui::Color32::from_rgb(121, 81, 70),
+            accent: egui::Color32::from_rgb(225, 126, 94),
+            title: egui::Color32::from_rgb(255, 184, 154),
+            body: egui::Color32::from_rgb(248, 244, 242),
+            muted: egui::Color32::from_rgb(218, 202, 196),
+        },
+        (true, true) => AlarmPopupPalette {
+            shell_fill: egui::Color32::from_rgb(34, 31, 25),
+            card_fill: egui::Color32::from_rgb(45, 39, 28),
+            border: egui::Color32::from_rgb(118, 92, 49),
+            accent: egui::Color32::from_rgb(211, 156, 70),
+            title: egui::Color32::from_rgb(244, 202, 124),
+            body: egui::Color32::from_rgb(248, 244, 238),
+            muted: egui::Color32::from_rgb(216, 204, 184),
+        },
+        (false, false) => AlarmPopupPalette {
+            shell_fill: egui::Color32::from_rgb(255, 240, 231),
+            card_fill: egui::Color32::from_rgb(255, 225, 211),
+            border: egui::Color32::from_rgb(220, 132, 96),
+            accent: egui::Color32::from_rgb(196, 80, 43),
+            title: egui::Color32::from_rgb(125, 49, 24),
+            body: egui::Color32::from_rgb(34, 28, 25),
+            muted: egui::Color32::from_rgb(75, 57, 49),
+        },
+        (false, true) => AlarmPopupPalette {
+            shell_fill: egui::Color32::from_rgb(255, 246, 224),
+            card_fill: egui::Color32::from_rgb(255, 234, 188),
+            border: egui::Color32::from_rgb(211, 160, 70),
+            accent: egui::Color32::from_rgb(168, 105, 18),
+            title: egui::Color32::from_rgb(99, 63, 16),
+            body: egui::Color32::from_rgb(38, 32, 24),
+            muted: egui::Color32::from_rgb(76, 63, 42),
+        },
+    }
+}
+
+fn app_notice_title(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Info => "Notice",
+        LogLevel::Error => "Could not do that",
+    }
+}
+
+fn app_notice_palette(visuals: &egui::Visuals, level: LogLevel) -> AppNoticePalette {
+    match (visuals.dark_mode, level) {
+        (true, LogLevel::Info) => AppNoticePalette {
+            fill: egui::Color32::from_rgb(24, 37, 37),
+            border: egui::Color32::from_rgb(56, 104, 103),
+            accent: egui::Color32::from_rgb(74, 178, 169),
+            title: egui::Color32::from_rgb(145, 227, 217),
+            body: egui::Color32::from_rgb(236, 248, 246),
+        },
+        (true, LogLevel::Error) => AppNoticePalette {
+            fill: egui::Color32::from_rgb(43, 30, 27),
+            border: egui::Color32::from_rgb(131, 72, 62),
+            accent: egui::Color32::from_rgb(236, 116, 94),
+            title: egui::Color32::from_rgb(255, 180, 162),
+            body: egui::Color32::from_rgb(250, 239, 236),
+        },
+        (false, LogLevel::Info) => AppNoticePalette {
+            fill: egui::Color32::from_rgb(230, 249, 246),
+            border: egui::Color32::from_rgb(84, 162, 156),
+            accent: egui::Color32::from_rgb(31, 139, 132),
+            title: egui::Color32::from_rgb(18, 86, 82),
+            body: egui::Color32::from_rgb(26, 43, 41),
+        },
+        (false, LogLevel::Error) => AppNoticePalette {
+            fill: egui::Color32::from_rgb(255, 239, 234),
+            border: egui::Color32::from_rgb(211, 116, 93),
+            accent: egui::Color32::from_rgb(197, 75, 48),
+            title: egui::Color32::from_rgb(120, 42, 28),
+            body: egui::Color32::from_rgb(43, 31, 27),
+        },
+    }
+}
+
+fn copy_to_clipboard(ctx: &egui::Context, text: impl Into<String>) {
+    ctx.copy_text(text.into());
+}
+
+fn copyable_label(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    copyable_rich_label(ui, egui::RichText::new(text.clone()), text)
+}
+
+fn copyable_monospace_label(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let text = text.into();
+    copyable_rich_label(ui, egui::RichText::new(text.clone()).monospace(), text)
+}
+
+fn copyable_rich_label(
+    ui: &mut egui::Ui,
+    label: egui::RichText,
+    copy_text: impl Into<String>,
+) -> egui::Response {
+    let copy_text = copy_text.into();
+    let response = ui
+        .add(egui::Label::new(label).selectable(true))
+        .on_hover_text("Right-click to copy");
+
+    response.context_menu(|ui| {
+        if ui.button("Copy").clicked() {
+            copy_to_clipboard(ui.ctx(), copy_text);
+            ui.close();
+        }
+    });
+
+    response
 }
 
 fn readable_checkbox(

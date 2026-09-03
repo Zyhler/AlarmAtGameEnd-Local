@@ -1,7 +1,7 @@
 use crate::alarm::{Alarm, AlarmEngine, AlarmId, AlarmSnapshot, PendingAlarmSnapshot};
 use crate::game::{GameDetectionConfig, GameMonitor, GameMonitorStatus};
 use crate::notifier::{DesktopNotifier, Notifier};
-use crate::sound::{AlarmSoundPlayer, SoundHandle, SoundPlayer};
+use crate::sound::{AlarmSoundPlayer, SoundHandle, SoundPlaybackSettings, SoundPlayer};
 use chrono::{DateTime, Local};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -14,6 +14,7 @@ pub enum MonitorCommand {
     CancelAlarm(AlarmId),
     Cancel,
     SetGameDetectionConfig(GameDetectionConfig),
+    SetSoundPlaybackSettings(SoundPlaybackSettings),
     TestSound(Option<PathBuf>),
     TestAlarmPopup(Option<PathBuf>),
     Shutdown,
@@ -68,6 +69,7 @@ pub struct MonitorHandle {
 impl MonitorHandle {
     pub fn spawn(
         game_detection_config: GameDetectionConfig,
+        sound_settings: SoundPlaybackSettings,
         restored_alarms: Vec<PendingAlarmSnapshot>,
     ) -> Self {
         let (command_sender, command_receiver) = mpsc::channel();
@@ -77,6 +79,7 @@ impl MonitorHandle {
                 command_receiver,
                 event_sender,
                 restored_alarms,
+                sound_settings,
                 GameMonitor::default_with_config(game_detection_config),
                 Box::new(DesktopNotifier),
                 Box::new(AlarmSoundPlayer),
@@ -119,6 +122,7 @@ fn run_monitor_loop(
     commands: Receiver<MonitorCommand>,
     events: Sender<MonitorEvent>,
     restored_alarms: Vec<PendingAlarmSnapshot>,
+    mut sound_settings: SoundPlaybackSettings,
     mut game_monitor: GameMonitor,
     notifier: Box<dyn Notifier>,
     sound_player: Box<dyn SoundPlayer>,
@@ -138,7 +142,10 @@ fn run_monitor_loop(
                 MonitorCommand::SetGameDetectionConfig(config) => {
                     game_monitor.apply_config(&config)
                 }
-                MonitorCommand::TestSound(path) => match sound_player.play(path) {
+                MonitorCommand::SetSoundPlaybackSettings(settings) => {
+                    sound_settings = settings;
+                }
+                MonitorCommand::TestSound(path) => match sound_player.play(path, sound_settings) {
                     Ok(sound) => {
                         let _ = events.send(MonitorEvent::TestSoundStarted {
                             sound,
@@ -151,7 +158,12 @@ fn run_monitor_loop(
                 },
                 MonitorCommand::TestAlarmPopup(path) => {
                     let fired_at = Local::now();
-                    let sound = play_alarm_sound(path, events.clone(), sound_player.as_ref());
+                    let sound = play_alarm_sound(
+                        path,
+                        sound_settings,
+                        events.clone(),
+                        sound_player.as_ref(),
+                    );
                     let _ = events.send(MonitorEvent::TestAlarmPopup {
                         label: "Test alarm notification".to_owned(),
                         fired_at,
@@ -172,6 +184,7 @@ fn run_monitor_loop(
 
             let sound = play_alarm_sound(
                 event.sound_path.clone(),
+                sound_settings,
                 events.clone(),
                 sound_player.as_ref(),
             );
@@ -197,10 +210,11 @@ fn run_monitor_loop(
 
 fn play_alarm_sound(
     sound_path: Option<PathBuf>,
+    sound_settings: SoundPlaybackSettings,
     events: Sender<MonitorEvent>,
     sound_player: &dyn SoundPlayer,
 ) -> Option<SoundHandle> {
-    match sound_player.play(sound_path) {
+    match sound_player.play(sound_path, sound_settings) {
         Ok(sound) => sound,
         Err(error) => {
             let _ = events.send(MonitorEvent::SoundError(error.to_string()));
@@ -219,10 +233,12 @@ mod tests {
         let player = RecordingSoundPlayer::default();
         let (events, _received_events) = mpsc::channel();
         let sound_path = PathBuf::from("C:/sounds/alarm.mp3");
+        let settings = SoundPlaybackSettings::from_percent(65, true);
 
-        let sound = play_alarm_sound(Some(sound_path.clone()), events, &player);
+        let sound = play_alarm_sound(Some(sound_path.clone()), settings, events, &player);
 
         assert_eq!(player.paths(), vec![Some(sound_path)]);
+        assert_eq!(player.settings(), vec![settings]);
         assert!(sound.is_some());
     }
 
@@ -232,8 +248,13 @@ mod tests {
         let (events, _received_events) = mpsc::channel();
         let sound_path = PathBuf::from("C:/sounds/alarm.mp3");
 
-        let sound =
-            play_alarm_sound(Some(sound_path.clone()), events, &player).expect("sound handle");
+        let sound = play_alarm_sound(
+            Some(sound_path.clone()),
+            SoundPlaybackSettings::default(),
+            events,
+            &player,
+        )
+        .expect("sound handle");
         sound.stop();
 
         assert_eq!(player.stopped_paths(), vec![sound_path]);

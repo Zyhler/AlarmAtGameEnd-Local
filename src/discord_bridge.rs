@@ -422,6 +422,10 @@ pub fn allowed_requester_ids(value: &str) -> Vec<String> {
     ids
 }
 
+pub fn normalize_allowed_requester_id(value: &str) -> Option<String> {
+    normalize_discord_user_id(value)
+}
+
 pub fn add_allowed_requester(existing: &str, user_id: &str) -> String {
     let Some(user_id) = normalize_discord_user_id(user_id) else {
         return allowed_requester_ids(existing).join("\n");
@@ -610,6 +614,19 @@ mod tests {
             allowed_requester_ids("333, <@222>; <@!444> nope 333"),
             vec!["222".to_owned(), "333".to_owned(), "444".to_owned()]
         );
+    }
+
+    #[test]
+    fn normalize_allowed_requester_id_accepts_ids_and_mentions_only() {
+        assert_eq!(
+            normalize_allowed_requester_id("222"),
+            Some("222".to_owned())
+        );
+        assert_eq!(
+            normalize_allowed_requester_id("<@!333>"),
+            Some("333".to_owned())
+        );
+        assert_eq!(normalize_allowed_requester_id("thisguysname"), None);
     }
 
     #[test]

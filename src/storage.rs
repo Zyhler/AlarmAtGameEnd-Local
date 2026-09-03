@@ -10,6 +10,7 @@ const STATE_DIR: &str = ".alarm_at_game_end";
 const STATE_FILE: &str = "state.json";
 const CRASH_LOG_FILE: &str = "crash.log";
 pub const DEFAULT_SOUND_PATH: &str = "sounds/universfield-alarm.mp3";
+pub const DEFAULT_SOUND_VOLUME_PERCENT: u8 = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PersistedState {
@@ -20,6 +21,10 @@ pub struct PersistedState {
     pub lockfile_path: String,
     #[serde(default = "default_sound_path")]
     pub sound_path: String,
+    #[serde(default = "default_sound_volume_percent")]
+    pub sound_volume_percent: u8,
+    #[serde(default)]
+    pub sound_fade_in: bool,
     #[serde(default = "default_counter_strike_2_gsi_port")]
     pub counter_strike_2_gsi_port: u16,
     #[serde(default = "default_counter_strike_2_gsi_config_path")]
@@ -88,6 +93,8 @@ impl Default for PersistedState {
             delay_for_games: default_delay_for_games(),
             lockfile_path: String::new(),
             sound_path: default_sound_path(),
+            sound_volume_percent: default_sound_volume_percent(),
+            sound_fade_in: false,
             counter_strike_2_gsi_port: default_counter_strike_2_gsi_port(),
             counter_strike_2_gsi_config_path: default_counter_strike_2_gsi_config_path(),
             logs: Vec::new(),
@@ -106,6 +113,10 @@ fn default_delay_for_games() -> bool {
 
 fn default_sound_path() -> String {
     DEFAULT_SOUND_PATH.to_owned()
+}
+
+fn default_sound_volume_percent() -> u8 {
+    DEFAULT_SOUND_VOLUME_PERCENT
 }
 
 fn default_counter_strike_2_gsi_port() -> u16 {
@@ -207,6 +218,8 @@ mod tests {
         assert!(state.delay_for_games);
         assert!(state.lockfile_path.is_empty());
         assert_eq!(state.sound_path, DEFAULT_SOUND_PATH);
+        assert_eq!(state.sound_volume_percent, DEFAULT_SOUND_VOLUME_PERCENT);
+        assert!(!state.sound_fade_in);
         assert_eq!(
             state.counter_strike_2_gsi_port,
             default_counter_strike_2_gsi_port()
@@ -242,6 +255,8 @@ mod tests {
             "C:/Riot Games/League of Legends/lockfile"
         );
         assert_eq!(state.sound_path, DEFAULT_SOUND_PATH);
+        assert_eq!(state.sound_volume_percent, DEFAULT_SOUND_VOLUME_PERCENT);
+        assert!(!state.sound_fade_in);
         assert_eq!(
             state.counter_strike_2_gsi_port,
             default_counter_strike_2_gsi_port()
@@ -315,6 +330,25 @@ mod tests {
             default_counter_strike_2_gsi_port()
         );
         assert!(!state.counter_strike_2_gsi_config_path.is_empty());
+    }
+
+    #[test]
+    fn saved_state_keeps_sound_playback_settings() {
+        let state: PersistedState = serde_json::from_str(
+            r#"{
+                "label": "Stretch",
+                "alarm_time": "20:15",
+                "delay_for_games": true,
+                "lockfile_path": "",
+                "sound_path": "",
+                "sound_volume_percent": 65,
+                "sound_fade_in": true
+            }"#,
+        )
+        .expect("saved state should parse");
+
+        assert_eq!(state.sound_volume_percent, 65);
+        assert!(state.sound_fade_in);
     }
 
     #[test]
