@@ -98,6 +98,7 @@ fn apply_style_for_theme(ctx: &egui::Context, theme: egui::Theme, accent_color: 
         }
         if let Some(font_id) = style.text_styles.get_mut(&egui::TextStyle::Monospace) {
             font_id.size = 13.5;
+            font_id.family = egui::FontFamily::Proportional;
         }
 
         let dark_mode = theme == egui::Theme::Dark;

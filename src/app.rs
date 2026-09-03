@@ -31,6 +31,8 @@ const ACCENT_BUTTON_PRESSED_SHRINK: f32 = 1.0;
 const MAX_LOG_ENTRIES: usize = 500;
 const PAGE_ROW_SPACING_Y: f32 = 8.0;
 const PAGE_CONTROL_HEIGHT: f32 = 32.0;
+const TEXT_INPUT_HORIZONTAL_MARGIN: i8 = 4;
+const TEXT_INPUT_MIN_VERTICAL_MARGIN: i8 = 2;
 const MAX_APP_NOTICES: usize = 3;
 const APP_NOTICE_TTL: Duration = Duration::from_secs(4);
 const APP_NOTICE_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
@@ -1288,7 +1290,7 @@ impl AlarmApp {
             ui,
             &mut self.state.sound_fade_in,
             self.accent_color,
-            "Fade in alarm sound",
+            "Fade in for the sound",
         )
         .changed()
         {
@@ -1297,7 +1299,7 @@ impl AlarmApp {
         }
         ui.label(
             egui::RichText::new(
-                "Fade-in gradually raises volume for the first 5 seconds. It does a little extra work while the sound starts; leave it off on slow PCs if audio stutters.",
+                "Note: Gradually increases the alarm volume over the first 5 seconds until it reaches your selected volume. Turn this off if the audio stutters, as it may use more CPU.",
             )
             .color(crate::theme::muted_text_color(ui.visuals())),
         );
@@ -1456,22 +1458,29 @@ impl AlarmApp {
         }
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Add by ID");
-            let input_height = row_control_height(ui);
-            text_input_with_min_height(
-                ui,
-                self.accent_color,
-                "discord_new_allowed_requester_id",
-                &mut self.new_allowed_requester_id,
-                260.0,
-                "Discord ID (numbers)",
-                input_height,
-            );
+        ui.scope(|ui| {
+            let input_height = text_input_height_for_min_control_height(ui, row_control_height(ui));
+            ui.spacing_mut().interact_size.y = input_height;
 
-            if accent_button_with_min_height(ui, "Add", self.accent_color, input_height).clicked() {
-                self.add_allowed_requester_from_input();
-            }
+            ui.horizontal(|ui| {
+                row_label_with_height(ui, "Add by ID", input_height);
+                text_input_with_min_height(
+                    ui,
+                    self.accent_color,
+                    "discord_new_allowed_requester_id",
+                    &mut self.new_allowed_requester_id,
+                    260.0,
+                    "Discord ID (numbers)",
+                    input_height,
+                );
+
+                let add_clicked =
+                    accent_button_with_min_height(ui, "Add", self.accent_color, input_height)
+                        .clicked();
+                if add_clicked {
+                    self.add_allowed_requester_from_input();
+                }
+            });
         });
     }
 
@@ -2265,6 +2274,42 @@ fn row_control_height(ui: &egui::Ui) -> f32 {
     ui.spacing().interact_size.y.max(PAGE_CONTROL_HEIGHT)
 }
 
+fn default_text_input_line_height(ui: &egui::Ui) -> f32 {
+    ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().extra_text_line_spacing
+}
+
+fn text_input_vertical_margin_for_height(ui: &egui::Ui, min_height: f32) -> i8 {
+    let vertical_margin = ((min_height - default_text_input_line_height(ui)) / 2.0)
+        .ceil()
+        .max(f32::from(TEXT_INPUT_MIN_VERTICAL_MARGIN));
+    vertical_margin.min(f32::from(i8::MAX)) as i8
+}
+
+fn text_input_height_for_min_control_height(ui: &egui::Ui, min_height: f32) -> f32 {
+    let vertical_margin = text_input_vertical_margin_for_height(ui, min_height);
+    default_text_input_line_height(ui) + (f32::from(vertical_margin) * 2.0)
+}
+
+fn row_label_with_height(ui: &mut egui::Ui, label: &'static str, height: f32) -> egui::Response {
+    let label_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            ui.visuals().text_color(),
+        )
+        .size()
+        .x
+        .ceil();
+
+    ui.allocate_ui_with_layout(
+        egui::vec2(label_width, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| ui.label(label),
+    )
+    .inner
+}
+
 fn alarm_volume_control(
     ui: &mut egui::Ui,
     accent_color: egui::Color32,
@@ -2293,6 +2338,7 @@ fn framed_alarm_volume_slider(
             .stroke(stroke)
             .corner_radius(5)
             .show(ui, |ui| {
+                ui.spacing_mut().slider_width = ALARM_VOLUME_SLIDER_WIDTH;
                 ui.set_min_size(egui::vec2(ALARM_VOLUME_SLIDER_WIDTH, control_height));
                 ui.add_sized(
                     egui::vec2(ALARM_VOLUME_SLIDER_WIDTH, control_height),
@@ -2466,7 +2512,12 @@ fn text_input_with_optional_min_height(
             .hint_text(hint_text);
 
         if let Some(min_height) = min_height {
-            text_edit = text_edit.min_size(egui::vec2(desired_width, min_height));
+            text_edit = text_edit
+                .min_size(egui::vec2(desired_width, min_height))
+                .margin(egui::Margin::symmetric(
+                    TEXT_INPUT_HORIZONTAL_MARGIN,
+                    text_input_vertical_margin_for_height(ui, min_height),
+                ));
         }
 
         ui.add(text_edit)
