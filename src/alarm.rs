@@ -284,13 +284,21 @@ pub fn next_alarm_time(
     input: &str,
     now: DateTime<Local>,
 ) -> Result<DateTime<Local>, AlarmTimeError> {
+    next_alarm_time_in_timezone(input, now)
+}
+
+fn next_alarm_time_in_timezone<Tz: TimeZone>(
+    input: &str,
+    now: DateTime<Tz>,
+) -> Result<DateTime<Tz>, AlarmTimeError> {
     let time = parse_alarm_time(input)?;
     let today = now.date_naive();
-    let mut candidate = local_datetime(today, time)?;
+    let timezone = now.timezone();
+    let mut candidate = local_datetime(today, time, &timezone, &now)?;
 
     if candidate <= now {
         let tomorrow = today.succ_opt().ok_or(AlarmTimeError::DateOverflow)?;
-        candidate = local_datetime(tomorrow, time)?;
+        candidate = local_datetime(tomorrow, time, &timezone, &now)?;
     }
 
     Ok(candidate)
@@ -349,10 +357,15 @@ fn time_separator(input: &str) -> Result<char, AlarmTimeError> {
     Ok(separator)
 }
 
-fn local_datetime(date: NaiveDate, time: NaiveTime) -> Result<DateTime<Local>, AlarmTimeError> {
-    match Local.from_local_datetime(&NaiveDateTime::new(date, time)) {
+fn local_datetime<Tz: TimeZone>(
+    date: NaiveDate,
+    time: NaiveTime,
+    timezone: &Tz,
+    now: &DateTime<Tz>,
+) -> Result<DateTime<Tz>, AlarmTimeError> {
+    match timezone.from_local_datetime(&NaiveDateTime::new(date, time)) {
         LocalResult::Single(value) => Ok(value),
-        LocalResult::Ambiguous(earlier, _) => Ok(earlier),
+        LocalResult::Ambiguous(earlier, later) => Ok(if earlier > *now { earlier } else { later }),
         LocalResult::None => Err(AlarmTimeError::InvalidLocalTime),
     }
 }
@@ -360,7 +373,81 @@ fn local_datetime(date: NaiveDate, time: NaiveTime) -> Result<DateTime<Local>, A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, FixedOffset};
+
+    // A deterministic zone modeling the single 2026 autumn transition used by these tests.
+    #[derive(Clone, Debug)]
+    struct AutumnChange;
+
+    impl AutumnChange {
+        fn transition_date() -> NaiveDate {
+            NaiveDate::from_ymd_opt(2026, 10, 25).expect("test date is valid")
+        }
+
+        fn offset(hours: i32) -> FixedOffset {
+            FixedOffset::east_opt(hours * 3600).expect("test offset is valid")
+        }
+    }
+
+    impl TimeZone for AutumnChange {
+        type Offset = FixedOffset;
+
+        fn from_offset(_offset: &FixedOffset) -> Self {
+            Self
+        }
+
+        fn offset_from_local_date(&self, local: &NaiveDate) -> LocalResult<FixedOffset> {
+            self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).expect("midnight is valid"))
+        }
+
+        fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> LocalResult<FixedOffset> {
+            let start = Self::transition_date()
+                .and_hms_opt(2, 0, 0)
+                .expect("test time is valid");
+            let end = start + Duration::hours(1);
+            if *local < start {
+                LocalResult::Single(Self::offset(2))
+            } else if *local < end {
+                LocalResult::Ambiguous(Self::offset(2), Self::offset(1))
+            } else {
+                LocalResult::Single(Self::offset(1))
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_hms_opt(0, 0, 0).expect("midnight is valid"))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> FixedOffset {
+            let transition = Self::transition_date()
+                .and_hms_opt(1, 0, 0)
+                .expect("test time is valid");
+            Self::offset(if *utc < transition { 2 } else { 1 })
+        }
+    }
+
+    #[test]
+    fn next_alarm_time_selects_the_next_occurrence_across_an_autumn_clock_change() {
+        for (now, expected) in [
+            ("2026-10-25T01:45:00+02:00", "2026-10-25T02:30:00+02:00"),
+            ("2026-10-25T02:30:00+02:00", "2026-10-25T02:30:00+01:00"),
+            ("2026-10-25T02:45:00+02:00", "2026-10-25T02:30:00+01:00"),
+            ("2026-10-25T02:15:00+01:00", "2026-10-25T02:30:00+01:00"),
+            ("2026-10-25T02:45:00+01:00", "2026-10-26T02:30:00+01:00"),
+            ("2026-10-25T02:30:00+01:00", "2026-10-26T02:30:00+01:00"),
+        ] {
+            let now = DateTime::parse_from_rfc3339(now)
+                .expect("test timestamp is valid")
+                .with_timezone(&AutumnChange);
+            let expected = DateTime::parse_from_rfc3339(expected).expect("test timestamp is valid");
+            let actual = next_alarm_time_in_timezone("02:30", now).expect("alarm should schedule");
+            assert_eq!(
+                actual.fixed_offset(),
+                expected,
+                "incorrect occurrence for {now}"
+            );
+        }
+    }
 
     #[test]
     fn inactive_alarm_fires_when_due() {

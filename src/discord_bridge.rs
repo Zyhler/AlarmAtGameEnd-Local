@@ -5,6 +5,7 @@ use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
+use std::fmt;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -13,7 +14,7 @@ pub const DEFAULT_BRIDGE_URL: &str = "https://aagedb.zyhlerservers.ddns.net";
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct DiscordBridgeSettings {
     #[serde(
         default = "default_bridge_url",
@@ -31,6 +32,24 @@ pub struct DiscordBridgeSettings {
     #[serde(default)]
     pub allowed_requesters: Vec<AllowedDiscordRequester>,
     pub poll_enabled: bool,
+}
+
+impl fmt::Debug for DiscordBridgeSettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DiscordBridgeSettings")
+            .field("bridge_url", &self.bridge_url)
+            .field("companion_id", &self.companion_id)
+            .field("api_token", &"<redacted>")
+            .field("pairing_code", &"<redacted>")
+            .field("pairing_expires_at", &self.pairing_expires_at)
+            .field("paired_discord_user_id", &self.paired_discord_user_id)
+            .field("paired_discord_user_label", &self.paired_discord_user_label)
+            .field("allowed_requester_ids", &self.allowed_requester_ids)
+            .field("allowed_requesters", &self.allowed_requesters)
+            .field("poll_enabled", &self.poll_enabled)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -89,11 +108,22 @@ impl DiscordBridgeSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BridgeClientConfig {
     bridge_url: String,
     companion_id: String,
     api_token: String,
+}
+
+impl fmt::Debug for BridgeClientConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BridgeClientConfig")
+            .field("bridge_url", &self.bridge_url)
+            .field("companion_id", &self.companion_id)
+            .field("api_token", &"<redacted>")
+            .finish()
+    }
 }
 
 impl BridgeClientConfig {
@@ -205,7 +235,7 @@ impl InviteStatus {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct PairingRegistrationRequest<'a> {
     companion_id: &'a str,
     api_token: &'a str,
@@ -496,6 +526,39 @@ pub fn forget_allowed_requester(settings: &mut DiscordBridgeSettings, user_id: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bridge_debug_redacts_secrets_without_changing_saved_credentials() {
+        let settings = DiscordBridgeSettings {
+            companion_id: "test-companion".to_owned(),
+            api_token: "test-secret-token".to_owned(),
+            pairing_code: "A1B2-C3D4".to_owned(),
+            ..DiscordBridgeSettings::default()
+        };
+        let config = settings
+            .client_config()
+            .expect("credentials should be valid");
+
+        for debug in [format!("{settings:?}"), format!("{config:?}")] {
+            assert!(
+                !debug.contains(&settings.api_token),
+                "API token leaked: {debug}"
+            );
+            assert!(
+                !debug.contains(&settings.pairing_code),
+                "pairing code leaked: {debug}"
+            );
+            assert!(debug.contains("<redacted>"));
+        }
+
+        let saved = serde_json::to_string(&settings).expect("settings should serialize");
+        let reloaded: DiscordBridgeSettings =
+            serde_json::from_str(&saved).expect("saved settings should deserialize");
+        assert_eq!(
+            reloaded, settings,
+            "redaction must not change saved credentials"
+        );
+    }
 
     #[test]
     fn default_bridge_url_points_to_configured_server() {

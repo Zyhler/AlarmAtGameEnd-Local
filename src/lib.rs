@@ -1,3 +1,5 @@
+//! Desktop alarm application with game-aware scheduling and optional Discord requests.
+
 pub mod alarm;
 pub mod app;
 pub mod counter_strike;
@@ -14,6 +16,10 @@ pub mod worker;
 pub const APP_NAME: &str = "Alarm at Game End";
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
+/// Starts the desktop application using the saved graphics preference.
+///
+/// # Errors
+/// Returns an error if the window or graphics backend cannot be initialized.
 pub fn run() -> eframe::Result {
     let native_options = native_options_from_saved_state();
 
@@ -38,7 +44,7 @@ fn native_options_from_saved_state() -> eframe::NativeOptions {
 fn apply_app_icon(native_options: &mut eframe::NativeOptions) {
     match eframe::icon_data::from_png_bytes(APP_ICON_PNG) {
         Ok(icon) => {
-            native_options.viewport = native_options.viewport.clone().with_icon(icon);
+            native_options.viewport = std::mem::take(&mut native_options.viewport).with_icon(icon);
         }
         Err(error) => {
             eprintln!("could not load app icon: {error}");

@@ -42,8 +42,11 @@ const ALARM_VOLUME_VALUE_WIDTH: f32 = 56.0;
 
 pub struct AlarmApp {
     state: PersistedState,
+    state_path: PathBuf,
+    state_writes_enabled: bool,
     monitor: MonitorHandle,
     snapshot: MonitorSnapshot,
+    alarm_revision: u64,
     alarm_popups: Vec<AlarmPopup>,
     next_alarm_id: AlarmId,
     next_alarm_popup_id: u64,
@@ -146,45 +149,65 @@ struct AppNoticePalette {
 
 impl AlarmApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let (mut state, load_error) = match storage::load_state() {
+        let mut app = Self::from_state_path(storage::state_path(), MonitorHandle::spawn);
+        crate::theme::apply_app_style(&cc.egui_ctx, app.state.theme_preference, app.accent_color);
+        if let Ok(Some(notice)) = crate::crash::latest_crash_notice()
+            && app.state.last_reported_crash_fingerprint.as_deref()
+                != Some(notice.fingerprint.as_str())
+        {
+            app.state.last_reported_crash_fingerprint = Some(notice.fingerprint);
+            app.log_error(format!(
+                "Previous crash recorded: {}. Crash log: {}",
+                notice.summary,
+                notice.path.display()
+            ));
+        }
+        app
+    }
+
+    fn from_state_path(
+        state_path: PathBuf,
+        spawn_monitor: impl FnOnce(
+            GameDetectionConfig,
+            SoundPlaybackSettings,
+            Vec<PendingAlarmSnapshot>,
+        ) -> MonitorHandle,
+    ) -> Self {
+        let (mut state, load_error) = match storage::load_state_from_path(&state_path) {
             Ok(state) => (state, None),
             Err(error) => (
                 PersistedState::default(),
                 Some(format!("Could not load saved state: {error}")),
             ),
         };
-        let crash_notice = crate::crash::latest_crash_notice()
-            .ok()
-            .flatten()
-            .filter(|notice| {
-                state.last_reported_crash_fingerprint.as_deref()
-                    != Some(notice.fingerprint.as_str())
-            });
         let logs = log_entries_from_persisted(&state.logs);
         let saved_alarms = std::mem::take(&mut state.alarms);
         let next_alarm_id = next_alarm_id_after(&saved_alarms);
         let now = Local::now();
         let (restored_alarms, missed_alarms) = split_saved_alarms(saved_alarms, now);
+        let restored_alarm_count = restored_alarms.len();
         let initial_alarm_snapshot =
             AlarmEngine::from_pending_alarms(restored_alarms.clone()).snapshot();
         state.alarms = restored_alarms.clone();
         let accent_color = crate::theme::system_accent_color();
-        crate::theme::apply_app_style(&cc.egui_ctx, state.theme_preference, accent_color);
-
-        let monitor = MonitorHandle::spawn(
+        let monitor = spawn_monitor(
             game_detection_config_from_state(&state),
             sound_playback_settings_from_state(&state),
-            restored_alarms.clone(),
+            restored_alarms,
         );
 
         let mut app = Self {
             state,
+            state_path,
+            state_writes_enabled: load_error.is_none(),
             monitor,
             snapshot: MonitorSnapshot {
                 alarm: initial_alarm_snapshot,
+                applied_alarm_revision: 0,
                 game_status: Default::default(),
                 last_checked: now,
             },
+            alarm_revision: 0,
             alarm_popups: Vec::new(),
             next_alarm_id,
             next_alarm_popup_id: 1,
@@ -208,28 +231,19 @@ impl AlarmApp {
             app.state.graphics_backend_preference.label()
         ));
 
-        if !restored_alarms.is_empty() {
-            app.log_info(format!(
-                "Restored {} pending alarm(s)",
-                restored_alarms.len()
-            ));
+        if restored_alarm_count > 0 {
+            app.log_info(format!("Restored {restored_alarm_count} pending alarm(s)"));
         }
 
         for missed_alarm in missed_alarms {
             app.show_missed_alarm(missed_alarm);
         }
 
-        if let Some(notice) = crash_notice {
-            app.state.last_reported_crash_fingerprint = Some(notice.fingerprint);
-            app.log_error(format!(
-                "Previous crash recorded: {}. Crash log: {}",
-                notice.summary,
-                notice.path.display()
-            ));
-        }
-
         if let Some(error) = load_error {
-            app.log_error(error);
+            app.notify_error(format!(
+                "{error}. Automatic saving is paused to preserve {}. Restore the file and restart to resume saving.",
+                app.state_path.display()
+            ));
         }
 
         app
@@ -242,6 +256,12 @@ impl AlarmApp {
         for event in events {
             match event {
                 MonitorEvent::Snapshot(snapshot) => {
+                    if snapshot.applied_alarm_revision < self.alarm_revision {
+                        // Detection can update while the worker catches up with local alarm edits.
+                        self.snapshot.game_status = snapshot.game_status;
+                        self.snapshot.last_checked = snapshot.last_checked;
+                        continue;
+                    }
                     let alarms_changed = self.snapshot.alarm.alarms != snapshot.alarm.alarms;
                     self.snapshot = snapshot;
 
@@ -334,7 +354,7 @@ impl AlarmApp {
     }
 
     fn show_missed_alarm(&mut self, alarm: PendingAlarmSnapshot) {
-        let label = alarm.alarm.label.clone();
+        let label = alarm.alarm.label;
         let scheduled_for = alarm.alarm.scheduled_for;
 
         self.log_at(
@@ -437,10 +457,13 @@ impl AlarmApp {
     }
 
     fn persist_current_state(&mut self) -> bool {
+        if !self.state_writes_enabled {
+            return false;
+        }
         self.state.logs = persisted_log_entries_from_logs(&self.logs);
         self.state.alarms = self.snapshot.alarm.alarms.clone();
 
-        match storage::save_state(&self.state) {
+        match storage::save_state_to_path(&self.state, &self.state_path) {
             Ok(()) => true,
             Err(error) => {
                 self.push_log(
@@ -515,8 +538,21 @@ impl AlarmApp {
         self.snapshot.alarm.last_fired_label = None;
         refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
 
-        self.monitor.send(MonitorCommand::Schedule { id, alarm });
+        let revision = self.next_alarm_revision();
+        self.monitor.send(MonitorCommand::Schedule {
+            id,
+            alarm,
+            revision,
+        });
         Ok(scheduled_for)
+    }
+
+    fn next_alarm_revision(&mut self) -> u64 {
+        self.alarm_revision = self
+            .alarm_revision
+            .checked_add(1)
+            .expect("a single app session cannot exhaust u64 alarm revisions");
+        self.alarm_revision
     }
 
     fn save_settings(&mut self) -> bool {
@@ -526,6 +562,25 @@ impl AlarmApp {
         self.apply_sound_playback_settings();
 
         self.persist_current_state()
+    }
+
+    fn cancel_alarm(&mut self, id: AlarmId, label: &str) {
+        let revision = self.next_alarm_revision();
+        self.monitor
+            .send(MonitorCommand::CancelAlarm { id, revision });
+        self.snapshot.alarm.alarms.retain(|alarm| alarm.id != id);
+        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+        self.notify_info(format!("Alarm cancelled: {label}"));
+    }
+
+    fn cancel_all_alarms(&mut self) {
+        let revision = self.next_alarm_revision();
+        self.monitor.send(MonitorCommand::Cancel { revision });
+        self.snapshot.alarm.alarms.clear();
+        self.snapshot.alarm.fired_at = None;
+        self.snapshot.alarm.last_fired_label = None;
+        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+        self.notify_info("All alarms cancelled");
     }
 
     fn apply_sound_playback_settings(&self) {
@@ -614,6 +669,7 @@ impl AlarmApp {
     }
 
     fn clear_bridge_pairing(&mut self) {
+        self.invalidate_bridge_tasks();
         self.state.discord_bridge.companion_id.clear();
         self.state.discord_bridge.api_token.clear();
         self.state.discord_bridge.pairing_code.clear();
@@ -628,6 +684,11 @@ impl AlarmApp {
         self.persist_current_state();
         self.set_bridge_status("Disconnected");
         self.notify_info("Discord pairing cleared");
+    }
+
+    fn invalidate_bridge_tasks(&mut self) {
+        self.bridge_registration = None;
+        self.bridge_poll = None;
     }
 
     fn clear_inactive_bridge_pairing_code(&mut self) -> bool {
@@ -756,10 +817,9 @@ impl AlarmApp {
             || self.state.discord_bridge.paired_discord_user_label
                 != response.paired_discord_user_label
         {
-            self.state.discord_bridge.paired_discord_user_id =
-                response.paired_discord_user_id.clone();
+            self.state.discord_bridge.paired_discord_user_id = response.paired_discord_user_id;
             self.state.discord_bridge.paired_discord_user_label =
-                response.paired_discord_user_label.clone();
+                response.paired_discord_user_label;
             bridge_settings_changed = true;
         }
 
@@ -1069,14 +1129,7 @@ impl AlarmApp {
                     copyable_label(ui, pending_alarm.status.as_str());
 
                     if accent_button(ui, "Cancel", self.accent_color).clicked() {
-                        self.monitor
-                            .send(MonitorCommand::CancelAlarm(pending_alarm.id));
-                        self.snapshot
-                            .alarm
-                            .alarms
-                            .retain(|alarm| alarm.id != pending_alarm.id);
-                        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
-                        self.notify_info(format!("Alarm cancelled: {}", pending_alarm.alarm.label));
+                        self.cancel_alarm(pending_alarm.id, &pending_alarm.alarm.label);
                     }
 
                     ui.end_row();
@@ -1213,10 +1266,9 @@ impl AlarmApp {
             "Delay while a tracked game is active",
         )
         .changed()
+            && self.save_settings()
         {
-            if self.save_settings() {
-                self.log_info("Game delay setting saved");
-            }
+            self.log_info("Game delay setting saved");
         }
 
         ui.horizontal(|ui| {
@@ -1225,12 +1277,7 @@ impl AlarmApp {
             }
 
             if accent_button(ui, "Cancel All", self.accent_color).clicked() {
-                self.monitor.send(MonitorCommand::Cancel);
-                self.snapshot.alarm.alarms.clear();
-                self.snapshot.alarm.fired_at = None;
-                self.snapshot.alarm.last_fired_label = None;
-                refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
-                self.notify_info("All alarms cancelled");
+                self.cancel_all_alarms();
             }
         });
 
@@ -1238,6 +1285,11 @@ impl AlarmApp {
     }
 
     fn draw_settings_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.state_writes_enabled {
+            ui.colored_label(crate::theme::error_text_color(ui.visuals()),
+                "Saving is paused because the settings file could not be loaded. Restore the file and restart; see Log for its location.");
+            ui.separator();
+        }
         ui.heading("Appearance");
         if self.draw_theme_picker(ui) {
             self.apply_appearance(ui.ctx());
@@ -1368,6 +1420,8 @@ impl AlarmApp {
             );
 
             if response.changed() {
+                self.invalidate_bridge_tasks();
+                self.pending_companion_invites.clear();
                 self.persist_current_state();
             }
         });
@@ -1492,8 +1546,8 @@ impl AlarmApp {
         ui.separator();
         ui.heading("Pending Access Invites");
 
-        let invites = self.pending_companion_invites.clone();
-        for invite in invites {
+        let mut decision = None;
+        for invite in &self.pending_companion_invites {
             ui.group(|ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
@@ -1501,16 +1555,16 @@ impl AlarmApp {
                         ui,
                         format!(
                             "Allow {} to request alarms",
-                            discord_invite_user_label(&invite)
+                            discord_invite_user_label(invite)
                         ),
                     );
 
                     if accent_button(ui, "Allow", self.accent_color).clicked() {
-                        self.allow_companion_invite(invite.id);
+                        decision = Some((invite.id, InviteStatus::Allowed));
                     }
 
                     if accent_button(ui, "Reject", self.accent_color).clicked() {
-                        self.reject_companion_invite(invite.id);
+                        decision = Some((invite.id, InviteStatus::Rejected));
                     }
                 });
 
@@ -1521,6 +1575,13 @@ impl AlarmApp {
                     );
                 }
             });
+        }
+
+        if let Some((invite_id, status)) = decision {
+            match status {
+                InviteStatus::Allowed => self.allow_companion_invite(invite_id),
+                InviteStatus::Rejected => self.reject_companion_invite(invite_id),
+            }
         }
     }
 
@@ -2967,6 +3028,206 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    fn test_state_path() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("alarm_app_test_{}", rand::random::<u64>()))
+            .join("state.json")
+    }
+
+    fn test_app(path: PathBuf) -> (AlarmApp, mpsc::Sender<MonitorEvent>) {
+        let (monitor, events, _commands) = MonitorHandle::test_channels();
+        let app = AlarmApp::from_state_path(path, |_, _, _| monitor);
+        (app, events)
+    }
+
+    fn schedule_test_alarm(app: &mut AlarmApp) {
+        let time = (Local::now() + chrono::Duration::hours(1))
+            .format("%H:%M")
+            .to_string();
+        app.schedule_alarm_from_values("Test alarm".to_owned(), time)
+            .expect("test alarm should schedule");
+        app.persist_current_state();
+    }
+
+    #[test]
+    fn startup_preserves_a_state_file_that_cannot_be_loaded() {
+        let path = test_state_path();
+        std::fs::create_dir_all(path.parent().expect("test path has a parent"))
+            .expect("test directory should be created");
+        let original = r#"{"alarms": [recoverable but invalid JSON]}"#;
+        std::fs::write(&path, original).expect("test state should be written");
+
+        let (mut app, _) = test_app(path.clone());
+        app.log_info("Another automatic save attempt");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original file should remain"),
+            original,
+            "startup and logging must preserve state after a load error"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_remove_a_new_alarm() {
+        let path = test_state_path();
+        let (mut app, events) = test_app(path.clone());
+        let mut stale = app.snapshot.clone();
+        stale
+            .game_status
+            .statuses
+            .push(GameStatus::active("Test game", None));
+        schedule_test_alarm(&mut app);
+
+        events
+            .send(MonitorEvent::Snapshot(stale))
+            .expect("UI should receive snapshot");
+        app.drain_monitor_events(&egui::Context::default());
+
+        assert_eq!(
+            app.snapshot.alarm.alarms.len(),
+            1,
+            "new alarm must remain visible"
+        );
+        assert!(
+            app.snapshot.game_status.statuses[0].is_active(),
+            "game detection should still update"
+        );
+        assert_eq!(
+            storage::load_state_from_path(path)
+                .expect("saved state should load")
+                .alarms
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_restore_a_canceled_alarm() {
+        let path = test_state_path();
+        let (mut app, events) = test_app(path.clone());
+        schedule_test_alarm(&mut app);
+        let mut stale = app.snapshot.clone();
+        stale.applied_alarm_revision = app.alarm_revision;
+        let id = stale.alarm.alarms[0].id;
+        app.cancel_alarm(id, "Test alarm");
+
+        events
+            .send(MonitorEvent::Snapshot(stale))
+            .expect("UI should receive snapshot");
+        app.drain_monitor_events(&egui::Context::default());
+
+        assert!(
+            app.snapshot.alarm.alarms.is_empty(),
+            "canceled alarm must stay removed"
+        );
+        assert!(
+            storage::load_state_from_path(path)
+                .expect("saved state should load")
+                .alarms
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_undo_cancel_all() {
+        let (mut app, events) = test_app(test_state_path());
+        schedule_test_alarm(&mut app);
+        let mut stale = app.snapshot.clone();
+        stale.applied_alarm_revision = app.alarm_revision;
+        app.cancel_all_alarms();
+
+        events
+            .send(MonitorEvent::Snapshot(stale))
+            .expect("UI should receive snapshot");
+        app.drain_monitor_events(&egui::Context::default());
+
+        assert!(
+            app.snapshot.alarm.alarms.is_empty(),
+            "Cancel All must remain applied"
+        );
+    }
+
+    #[test]
+    fn clearing_pairing_discards_a_queued_registration_result() {
+        let (mut app, _) = test_app(test_state_path());
+        let (sender, receiver) = mpsc::channel();
+        app.bridge_registration = Some(receiver);
+        sender
+            .send(Ok(PairingRegistrationResponse {
+                pairing_code: "OLD-CODE".to_owned(),
+                expires_at_unix: (Local::now() + chrono::Duration::minutes(5)).timestamp(),
+            }))
+            .expect("registration should be queued");
+
+        app.clear_bridge_pairing();
+        app.drain_bridge_tasks(&egui::Context::default());
+
+        assert!(
+            app.state.discord_bridge.pairing_code.is_empty(),
+            "old code must not return"
+        );
+        assert!(app.bridge_registration.is_none());
+    }
+
+    #[test]
+    fn acknowledged_snapshot_updates_and_saves_alarm_status() {
+        let path = test_state_path();
+        let (mut app, events) = test_app(path.clone());
+        schedule_test_alarm(&mut app);
+        let mut acknowledged = app.snapshot.clone();
+        acknowledged.applied_alarm_revision = app.alarm_revision;
+        acknowledged.alarm.status = AlarmStatus::WaitingForGameEnd;
+        acknowledged.alarm.alarms[0].status = AlarmStatus::WaitingForGameEnd;
+        acknowledged.alarm.alarms[0].delayed_by_game = true;
+
+        events
+            .send(MonitorEvent::Snapshot(acknowledged))
+            .expect("UI should receive acknowledgement");
+        app.drain_monitor_events(&egui::Context::default());
+
+        assert_eq!(app.snapshot.alarm.status, AlarmStatus::WaitingForGameEnd);
+        let saved = storage::load_state_from_path(path).expect("saved state should load");
+        assert_eq!(saved.alarms[0].status, AlarmStatus::WaitingForGameEnd);
+        assert!(saved.alarms[0].delayed_by_game);
+    }
+
+    #[test]
+    fn healthy_state_keeps_saving_and_restores_alarms_on_restart() {
+        let path = test_state_path();
+        let (mut app, _) = test_app(path.clone());
+        schedule_test_alarm(&mut app);
+        let alarms = app.snapshot.alarm.alarms.clone();
+        drop(app);
+
+        let (restarted, _) = test_app(path);
+
+        assert_eq!(restarted.snapshot.alarm.alarms, alarms);
+    }
+
+    #[test]
+    fn clearing_pairing_discards_a_queued_poll_result() {
+        let (mut app, _) = test_app(test_state_path());
+        let (sender, receiver) = mpsc::channel();
+        app.bridge_poll = Some(receiver);
+        sender
+            .send(Ok(PollRequestsResponse {
+                paired: true,
+                paired_discord_user_id: Some("old-owner".to_owned()),
+                paired_discord_user_label: None,
+                requests: Vec::new(),
+                invites: Vec::new(),
+            }))
+            .expect("poll result should be queued");
+
+        app.clear_bridge_pairing();
+        app.drain_bridge_tasks(&egui::Context::default());
+
+        assert!(
+            app.state.discord_bridge.paired_discord_user_id.is_none(),
+            "old owner must not return"
+        );
+    }
+
     #[test]
     fn blank_lockfile_override_is_ignored() {
         assert_eq!(lockfile_override_from_text("   "), None);
@@ -3003,8 +3264,10 @@ mod tests {
 
     #[test]
     fn allowed_discord_user_rows_use_labels_when_available() {
-        let mut settings = DiscordBridgeSettings::default();
-        settings.allowed_requester_ids = "333\n222".to_owned();
+        let mut settings = DiscordBridgeSettings {
+            allowed_requester_ids: "333\n222".to_owned(),
+            ..DiscordBridgeSettings::default()
+        };
         settings
             .allowed_requesters
             .push(discord_bridge::AllowedDiscordRequester {
@@ -3029,8 +3292,10 @@ mod tests {
 
     #[test]
     fn requester_label_from_remote_request_updates_allowed_user_row() {
-        let mut settings = DiscordBridgeSettings::default();
-        settings.allowed_requester_ids = "222".to_owned();
+        let mut settings = DiscordBridgeSettings {
+            allowed_requester_ids: "222".to_owned(),
+            ..DiscordBridgeSettings::default()
+        };
         let request = RemoteDiscordAlarmRequest {
             id: 1,
             requester_id: "222".to_owned(),
@@ -3058,8 +3323,10 @@ mod tests {
 
     #[test]
     fn blank_requester_label_does_not_overwrite_known_allowed_user_name() {
-        let mut settings = DiscordBridgeSettings::default();
-        settings.allowed_requester_ids = "222".to_owned();
+        let mut settings = DiscordBridgeSettings {
+            allowed_requester_ids: "222".to_owned(),
+            ..DiscordBridgeSettings::default()
+        };
         discord_bridge::remember_allowed_requester(&mut settings, "222", "Jane");
         let request = RemoteDiscordAlarmRequest {
             id: 1,

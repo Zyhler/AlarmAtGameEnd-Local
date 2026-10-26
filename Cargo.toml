@@ -3,6 +3,12 @@ name = "alarm_at_game_end"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 [dependencies]
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }

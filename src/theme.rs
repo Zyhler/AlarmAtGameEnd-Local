@@ -75,9 +75,7 @@ pub fn accent_active_color(accent_color: egui::Color32, dark_mode: bool) -> egui
 }
 
 pub fn color_from_windows_argb(value: u32) -> egui::Color32 {
-    let red = ((value >> 16) & 0xff) as u8;
-    let green = ((value >> 8) & 0xff) as u8;
-    let blue = (value & 0xff) as u8;
+    let [_alpha, red, green, blue] = value.to_be_bytes();
 
     egui::Color32::from_rgb(red, green, blue)
 }
@@ -153,7 +151,7 @@ fn mix_colors(left: egui::Color32, right: egui::Color32, right_amount: f32) -> e
 }
 
 fn mix_channel(left: u8, right: u8, left_amount: f32, right_amount: f32) -> u8 {
-    ((left as f32 * left_amount) + (right as f32 * right_amount)).round() as u8
+    ((f32::from(left) * left_amount) + (f32::from(right) * right_amount)).round() as u8
 }
 
 fn relative_luminance(color: egui::Color32) -> f32 {
@@ -162,7 +160,7 @@ fn relative_luminance(color: egui::Color32) -> f32 {
 }
 
 fn linear_channel(value: u8) -> f32 {
-    let value = value as f32 / 255.0;
+    let value = f32::from(value) / 255.0;
 
     if value <= 0.03928 {
         value / 12.92
@@ -177,7 +175,9 @@ fn platform_accent_color() -> Option<egui::Color32> {
 
     let mut color = 0_u32;
     let mut opaque_blend = 0;
-    let result = unsafe { DwmGetColorizationColor(&mut color, &mut opaque_blend) };
+    // SAFETY: Both output pointers refer to live, writable values of the required types.
+    // DwmGetColorizationColor only uses them for the duration of this call.
+    let result = unsafe { DwmGetColorizationColor(&raw mut color, &raw mut opaque_blend) };
 
     if result < 0 {
         None

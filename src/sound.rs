@@ -55,9 +55,9 @@ impl SoundHandle {
     }
 
     pub fn stop(&self) {
-        if let Ok(mut stop) = self.stop.lock()
-            && let Some(stop) = stop.take()
-        {
+        // Drop also calls this method, so poisoned locks remain best-effort cleanup.
+        let stop = self.stop.lock().ok().and_then(|mut stop| stop.take());
+        if let Some(stop) = stop {
             stop();
         }
     }
@@ -324,5 +324,44 @@ pub mod tests {
         assert_eq!(normalized_volume(0.4), 0.4);
         assert_eq!(normalized_volume(2.0), 1.0);
         assert_eq!(normalized_volume(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn stop_callback_runs_without_holding_the_sound_lock() {
+        let sound = Arc::new_cyclic(|handle: &std::sync::Weak<SoundHandle>| {
+            let handle = handle.clone();
+            SoundHandle::new(
+                move || {
+                    let handle = handle.upgrade().expect("sound is alive during stop");
+                    assert!(
+                        handle.stop.try_lock().is_ok(),
+                        "stop callbacks must run after releasing the lock"
+                    );
+                },
+                Arc::new(AtomicBool::new(false)),
+            )
+        });
+
+        sound.stop();
+    }
+
+    #[test]
+    fn repeated_stop_and_drop_call_the_callback_once() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let sound = SoundHandle::new(
+            move || {
+                callback_calls.fetch_add(1, Ordering::Relaxed);
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        sound.stop();
+        sound.stop();
+        drop(sound);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

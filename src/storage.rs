@@ -3,7 +3,7 @@ use crate::discord_bridge::DiscordBridgeSettings;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 const STATE_DIR: &str = ".alarm_at_game_end";
@@ -129,9 +129,9 @@ fn default_counter_strike_2_gsi_config_path() -> String {
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("could not access local app state")]
+    #[error("could not access local app state: {0}")]
     Io(#[from] std::io::Error),
-    #[error("could not parse local app state")]
+    #[error("could not parse local app state: {0}")]
     Json(#[from] serde_json::Error),
 }
 
@@ -158,13 +158,7 @@ fn local_app_dir(state_dir: &str) -> PathBuf {
 }
 
 pub fn load_state() -> Result<PersistedState, StorageError> {
-    let path = state_path();
-
-    if !path.exists() {
-        return Ok(PersistedState::default());
-    }
-
-    load_state_from_path(path)
+    load_state_from_path(state_path())
 }
 
 pub fn save_state(state: &PersistedState) -> Result<(), StorageError> {
@@ -172,7 +166,15 @@ pub fn save_state(state: &PersistedState) -> Result<(), StorageError> {
     save_state_to_path(state, path)
 }
 
-pub fn save_state_to_path(state: &PersistedState, path: PathBuf) -> Result<(), StorageError> {
+/// Saves settings and alarms by replacing the destination only after serialization succeeds.
+///
+/// # Errors
+/// Returns an error if serialization, directory creation, writing, or replacement fails.
+pub fn save_state_to_path(
+    state: &PersistedState,
+    path: impl AsRef<Path>,
+) -> Result<(), StorageError> {
+    let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -181,7 +183,7 @@ pub fn save_state_to_path(state: &PersistedState, path: PathBuf) -> Result<(), S
     let temp_path = path.with_extension("json.tmp");
 
     fs::write(&temp_path, contents)?;
-    replace_state_file(&temp_path, &path)?;
+    replace_state_file(&temp_path, path)?;
     Ok(())
 }
 
@@ -189,20 +191,25 @@ pub fn load_state_from_str(contents: &str) -> Result<PersistedState, StorageErro
     Ok(serde_json::from_str(contents)?)
 }
 
-pub fn load_state_from_path(path: PathBuf) -> Result<PersistedState, StorageError> {
-    let contents = fs::read_to_string(path)?;
+/// Reads saved settings and alarms, using defaults when the file does not exist.
+///
+/// # Errors
+/// Returns an error if the file cannot be read or contains invalid state JSON.
+pub fn load_state_from_path(path: impl AsRef<Path>) -> Result<PersistedState, StorageError> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PersistedState::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
     load_state_from_str(&contents)
 }
 
-fn replace_state_file(temp_path: &PathBuf, path: &PathBuf) -> Result<(), StorageError> {
-    match fs::rename(temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(_) if path.exists() => {
-            fs::remove_file(path)?;
-            fs::rename(temp_path, path).map_err(StorageError::Io)
-        }
-        Err(error) => Err(StorageError::Io(error)),
-    }
+fn replace_state_file(temp_path: &Path, path: &Path) -> Result<(), StorageError> {
+    // A failed replacement must leave the previous settings and pending alarms intact.
+    fs::rename(temp_path, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -399,19 +406,55 @@ mod tests {
     #[test]
     fn save_state_to_path_writes_reloadable_state() {
         let path = unique_test_state_path();
-        let mut state = PersistedState::default();
-        state.label = "Saved label".to_owned();
+        let mut state = PersistedState {
+            label: "Saved label".to_owned(),
+            ..PersistedState::default()
+        };
         state.logs.push(PersistedLogEntry {
             occurred_at: Local::now(),
             level: PersistedLogLevel::Error,
             message: "Example error".to_owned(),
         });
 
-        save_state_to_path(&state, path.clone()).expect("state should save");
-        let reloaded = load_state_from_path(path).expect("state should reload");
+        save_state_to_path(&state, &path).expect("state should save");
+        let reloaded = load_state_from_path(&path).expect("state should reload");
 
         assert_eq!(reloaded.label, "Saved label");
         assert_eq!(reloaded.logs, state.logs);
+    }
+
+    #[test]
+    fn failed_state_replacement_preserves_previous_file() {
+        let path = unique_test_state_path();
+        let missing_temp_path = path.with_extension("missing");
+        fs::create_dir_all(path.parent().expect("test state has a parent"))
+            .expect("test directory should be created");
+        fs::write(&path, "previous state").expect("previous state should be written");
+
+        assert!(replace_state_file(&missing_temp_path, &path).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).expect("previous state must survive a failed replacement"),
+            "previous state"
+        );
+
+        fs::remove_file(path).expect("test state should be removed");
+    }
+
+    #[test]
+    fn saving_state_replaces_an_existing_file() {
+        let path = unique_test_state_path();
+        let mut state = PersistedState {
+            label: "original".to_owned(),
+            ..PersistedState::default()
+        };
+        save_state_to_path(&state, &path).expect("initial state should save");
+
+        state.label = "updated".to_owned();
+        save_state_to_path(&state, &path).expect("existing state should be replaced");
+
+        let reloaded = load_state_from_path(&path).expect("updated state should load");
+        assert_eq!(reloaded.label, "updated");
+        fs::remove_file(path).expect("test state should be removed");
     }
 
     fn unique_test_state_path() -> PathBuf {

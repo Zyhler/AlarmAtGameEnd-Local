@@ -16,6 +16,10 @@ pub const COUNTER_STRIKE_2_GSI_CONFIG_FILENAME: &str =
     "gamestate_integration_alarm_at_game_end.cfg";
 
 const GSI_STALE_AFTER: Duration = Duration::from_secs(15);
+// Bound headers and body together before allocating more memory or calculating body offsets.
+const MAX_GSI_REQUEST_BYTES: usize = 128 * 1024;
+// Limit a complete local update, in addition to the one-second timeout on each socket read.
+const GSI_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Cs2GsiConfigStatus {
@@ -307,7 +311,15 @@ fn map_detail(snapshot: &Cs2GsiSnapshot, fallback: &str) -> String {
 }
 
 fn handle_gsi_connection(stream: &mut TcpStream, state: &Arc<Mutex<Cs2GsiSnapshot>>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .is_err()
+    {
+        return;
+    }
 
     if let Ok(Some(body)) = read_http_body(stream) {
         update_gsi_state(&body, state);
@@ -316,14 +328,28 @@ fn handle_gsi_connection(stream: &mut TcpStream, state: &Arc<Mutex<Cs2GsiSnapsho
     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
-fn read_http_body(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, std::io::Error> {
+fn read_http_body(stream: &mut impl Read) -> Result<Option<Vec<u8>>, std::io::Error> {
+    read_http_body_until(stream, Instant::now() + GSI_REQUEST_TIMEOUT, Instant::now)
+}
+
+fn read_http_body_until(
+    stream: &mut impl Read,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
     let mut request = Vec::new();
     let mut buffer = [0; 4096];
     let mut header_end = None;
     let mut content_length = None;
 
     loop {
+        if now() >= deadline {
+            return Ok(None);
+        }
         let bytes_read = stream.read(&mut buffer)?;
+        if now() >= deadline {
+            return Ok(None);
+        }
 
         if bytes_read == 0 {
             break;
@@ -331,7 +357,7 @@ fn read_http_body(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, std::io::Er
 
         request.extend_from_slice(&buffer[..bytes_read]);
 
-        if request.len() > 128 * 1024 {
+        if request.len() > MAX_GSI_REQUEST_BYTES {
             return Ok(None);
         }
 
@@ -345,9 +371,15 @@ fn read_http_body(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, std::io::Er
 
         if let (Some(end), Some(length)) = (header_end, content_length) {
             let body_start = end + 4;
+            let Some(body_end) = body_start
+                .checked_add(length)
+                .filter(|&end| end <= MAX_GSI_REQUEST_BYTES)
+            else {
+                return Ok(None);
+            };
 
-            if request.len() >= body_start + length {
-                return Ok(Some(request[body_start..body_start + length].to_vec()));
+            if request.len() >= body_end {
+                return Ok(Some(request[body_start..body_end].to_vec()));
             }
         }
     }
@@ -404,6 +436,76 @@ pub enum Cs2GsiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_deadline_bounds_a_slow_fragmented_request() {
+        use std::cell::Cell;
+
+        struct SlowFragments<'a> {
+            bytes: &'a [u8],
+            elapsed: &'a Cell<Duration>,
+        }
+
+        impl Read for SlowFragments<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.elapsed
+                    .set(self.elapsed.get() + Duration::from_millis(600));
+                let limit = buffer.len().min(1);
+                self.bytes.read(&mut buffer[..limit])
+            }
+        }
+
+        let elapsed = Cell::new(Duration::ZERO);
+        let start = Instant::now();
+        let mut request = SlowFragments {
+            bytes: b"POST /cs2 HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+            elapsed: &elapsed,
+        };
+
+        let body = read_http_body_until(&mut request, start + GSI_REQUEST_TIMEOUT, || {
+            start + elapsed.get()
+        })
+        .expect("simulated reads should succeed");
+
+        assert_eq!(
+            body, None,
+            "individually timely reads must not extend the request budget"
+        );
+        assert!(
+            elapsed.get() < Duration::from_secs(3),
+            "request must stop near its deadline"
+        );
+    }
+
+    #[test]
+    fn http_body_rejects_overflowing_content_length() {
+        let request = format!(
+            "POST /cs2 HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            usize::MAX
+        );
+        let result = read_http_body(&mut request.as_bytes()).expect("request should be readable");
+
+        assert_eq!(result, None, "untrusted lengths must not overflow");
+    }
+
+    #[test]
+    fn http_body_reads_headers_and_body_in_separate_chunks() {
+        let headers = b"POST /cs2 HTTP/1.1\r\nContent-Length: 2\r\n\r\n";
+        let mut request = headers.as_slice().chain(b"{}trailing".as_slice());
+
+        let result = read_http_body(&mut request).expect("request should be readable");
+
+        assert_eq!(result, Some(b"{}".to_vec()));
+    }
+
+    #[test]
+    fn http_body_rejects_incomplete_body() {
+        let mut request = b"POST /cs2 HTTP/1.1\r\nContent-Length: 3\r\n\r\n{}".as_slice();
+
+        let result = read_http_body(&mut request).expect("request should be readable");
+
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn no_gsi_payload_is_inactive() {
