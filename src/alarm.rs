@@ -95,20 +95,45 @@ pub struct AlarmSnapshot {
     pub last_fired_label: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct AlarmEngine {
-    alarms: Vec<PendingAlarm>,
+impl AlarmSnapshot {
+    pub(crate) fn refresh_status(&mut self) {
+        self.status = pending_alarm_status(&self.alarms, self.fired_at);
+    }
+}
+
+pub(crate) fn sort_pending_alarms(alarms: &mut [PendingAlarmSnapshot]) {
+    alarms.sort_by(|left, right| {
+        left.alarm
+            .scheduled_for
+            .cmp(&right.alarm.scheduled_for)
+            .then(left.id.cmp(&right.id))
+    });
+}
+
+fn pending_alarm_status(
+    alarms: &[PendingAlarmSnapshot],
     fired_at: Option<DateTime<Local>>,
-    last_fired_label: Option<String>,
-    next_alarm_id: AlarmId,
+) -> AlarmStatus {
+    if alarms
+        .iter()
+        .any(|alarm| alarm.status == AlarmStatus::WaitingForGameEnd)
+    {
+        AlarmStatus::WaitingForGameEnd
+    } else if !alarms.is_empty() {
+        AlarmStatus::Scheduled
+    } else if fired_at.is_some() {
+        AlarmStatus::Fired
+    } else {
+        AlarmStatus::Idle
+    }
 }
 
 #[derive(Clone, Debug)]
-struct PendingAlarm {
-    id: AlarmId,
-    alarm: Alarm,
-    status: AlarmStatus,
-    delayed_by_game: bool,
+pub struct AlarmEngine {
+    alarms: Vec<PendingAlarmSnapshot>,
+    fired_at: Option<DateTime<Local>>,
+    last_fired_label: Option<String>,
+    next_alarm_id: AlarmId,
 }
 
 impl Default for AlarmEngine {
@@ -132,12 +157,6 @@ impl AlarmEngine {
         engine.alarms = alarms
             .into_iter()
             .filter(|alarm| alarm.status != AlarmStatus::Fired)
-            .map(|alarm| PendingAlarm {
-                id: alarm.id,
-                alarm: alarm.alarm,
-                status: alarm.status,
-                delayed_by_game: alarm.delayed_by_game,
-            })
             .collect();
         engine.sort_alarms();
         engine
@@ -151,7 +170,7 @@ impl AlarmEngine {
 
     pub fn schedule_with_id(&mut self, id: AlarmId, alarm: Alarm) -> AlarmId {
         self.next_alarm_id = self.next_alarm_id.max(id.saturating_add(1));
-        self.alarms.push(PendingAlarm {
+        self.alarms.push(PendingAlarmSnapshot {
             id,
             alarm,
             status: AlarmStatus::Scheduled,
@@ -205,48 +224,22 @@ impl AlarmEngine {
 
     pub fn snapshot(&self) -> AlarmSnapshot {
         AlarmSnapshot {
-            status: self.status(),
-            alarms: self
-                .alarms
-                .iter()
-                .map(|pending_alarm| PendingAlarmSnapshot {
-                    id: pending_alarm.id,
-                    alarm: pending_alarm.alarm.clone(),
-                    status: pending_alarm.status,
-                    delayed_by_game: pending_alarm.delayed_by_game,
-                })
-                .collect(),
+            status: pending_alarm_status(&self.alarms, self.fired_at),
+            alarms: self.alarms.clone(),
             fired_at: self.fired_at,
             last_fired_label: self.last_fired_label.clone(),
         }
     }
 
-    fn status(&self) -> AlarmStatus {
-        if self
-            .alarms
-            .iter()
-            .any(|alarm| alarm.status == AlarmStatus::WaitingForGameEnd)
-        {
-            AlarmStatus::WaitingForGameEnd
-        } else if !self.alarms.is_empty() {
-            AlarmStatus::Scheduled
-        } else if self.fired_at.is_some() {
-            AlarmStatus::Fired
-        } else {
-            AlarmStatus::Idle
-        }
-    }
-
     fn sort_alarms(&mut self) {
-        self.alarms.sort_by(|left, right| {
-            left.alarm
-                .scheduled_for
-                .cmp(&right.alarm.scheduled_for)
-                .then(left.id.cmp(&right.id))
-        });
+        sort_pending_alarms(&mut self.alarms);
     }
 
-    fn fire(&mut self, fired_at: DateTime<Local>, pending_alarm: PendingAlarm) -> AlarmEvent {
+    fn fire(
+        &mut self,
+        fired_at: DateTime<Local>,
+        pending_alarm: PendingAlarmSnapshot,
+    ) -> AlarmEvent {
         self.fired_at = Some(fired_at);
         self.last_fired_label = Some(pending_alarm.alarm.label.clone());
 

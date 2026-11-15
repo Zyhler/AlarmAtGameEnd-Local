@@ -1,14 +1,15 @@
 use crate::alarm::{
-    Alarm, AlarmEngine, AlarmId, AlarmSnapshot, AlarmStatus, AlarmTimeError, PendingAlarmSnapshot,
-    next_alarm_id_after, next_alarm_time, normalize_alarm_time_text,
+    Alarm, AlarmId, AlarmStatus, AlarmTimeError, PendingAlarmSnapshot, next_alarm_time,
+    normalize_alarm_time_text,
 };
+use crate::alarm_coordination::AlarmCoordination;
 use crate::counter_strike::{
     COUNTER_STRIKE_2_GAME_NAME, Cs2GsiConfigStatus, counter_strike_2_gsi_config_status,
     install_counter_strike_2_gsi_config,
 };
-use crate::discord_bridge::{
-    self, CompanionInvite, DiscordBridgeSettings, InviteStatus, PairingRegistrationResponse,
-    PollRequestsResponse, RemoteAlarmRequest as RemoteDiscordAlarmRequest, RequestStatus,
+use crate::discord_bridge::{self, DiscordBridgeSettings, InviteStatus};
+use crate::discord_session::{
+    DiscordSession, MessageKind, SessionTime, discord_invite_user_label, local_datetime_from_unix,
 };
 use crate::game::{GameDetectionConfig, GameStatus};
 use crate::league::GAME_NAME as LEAGUE_OF_LEGENDS_GAME_NAME;
@@ -17,12 +18,10 @@ use crate::storage::{
     self, PersistedGraphicsBackendPreference, PersistedLogEntry, PersistedLogLevel, PersistedState,
     PersistedThemePreference,
 };
-use crate::worker::{MonitorCommand, MonitorEvent, MonitorHandle, MonitorSnapshot};
-use chrono::{DateTime, Local, Utc};
+use crate::worker::{MonitorCommand, MonitorEvent, MonitorHandle};
+use chrono::{DateTime, Local};
 use eframe::egui;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const INLINE_DETECTED_GAME_LIMIT: usize = 4;
@@ -45,22 +44,15 @@ pub struct AlarmApp {
     state_path: PathBuf,
     state_writes_enabled: bool,
     monitor: MonitorHandle,
-    snapshot: MonitorSnapshot,
-    alarm_revision: u64,
+    alarms: AlarmCoordination,
     alarm_popups: Vec<AlarmPopup>,
-    next_alarm_id: AlarmId,
     next_alarm_popup_id: u64,
     test_sound: Option<SoundHandle>,
     logs: Vec<LogEntry>,
     app_notices: Vec<AppNotice>,
     current_page: AppPage,
     accent_color: egui::Color32,
-    bridge_registration: Option<Receiver<Result<PairingRegistrationResponse, String>>>,
-    bridge_poll: Option<Receiver<Result<PollRequestsResponse, String>>>,
-    next_bridge_poll_at: Instant,
-    bridge_status: String,
-    handled_bridge_request_ids: Vec<u64>,
-    pending_companion_invites: Vec<CompanionInvite>,
+    discord: DiscordSession,
     new_allowed_requester_id: String,
 }
 
@@ -181,47 +173,32 @@ impl AlarmApp {
             ),
         };
         let logs = log_entries_from_persisted(&state.logs);
-        let saved_alarms = std::mem::take(&mut state.alarms);
-        let next_alarm_id = next_alarm_id_after(&saved_alarms);
-        let now = Local::now();
-        let (restored_alarms, missed_alarms) = split_saved_alarms(saved_alarms, now);
-        let restored_alarm_count = restored_alarms.len();
-        let initial_alarm_snapshot =
-            AlarmEngine::from_pending_alarms(restored_alarms.clone()).snapshot();
-        state.alarms = restored_alarms.clone();
+        let (alarms, missed_alarms) =
+            AlarmCoordination::restore(std::mem::take(&mut state.alarms), Local::now());
+        state.alarms = alarms.snapshot().alarm.alarms.clone();
+        let restored_alarm_count = state.alarms.len();
         let accent_color = crate::theme::system_accent_color();
         let monitor = spawn_monitor(
             game_detection_config_from_state(&state),
             sound_playback_settings_from_state(&state),
-            restored_alarms,
+            state.alarms.clone(),
         );
 
+        let discord = DiscordSession::new(std::mem::take(&mut state.discord_bridge));
         let mut app = Self {
             state,
             state_path,
             state_writes_enabled: load_error.is_none(),
             monitor,
-            snapshot: MonitorSnapshot {
-                alarm: initial_alarm_snapshot,
-                applied_alarm_revision: 0,
-                game_status: Default::default(),
-                last_checked: now,
-            },
-            alarm_revision: 0,
+            alarms,
             alarm_popups: Vec::new(),
-            next_alarm_id,
             next_alarm_popup_id: 1,
             test_sound: None,
             logs,
             app_notices: Vec::new(),
             current_page: AppPage::Alarm,
             accent_color,
-            bridge_registration: None,
-            bridge_poll: None,
-            next_bridge_poll_at: Instant::now(),
-            bridge_status: "Disconnected".to_owned(),
-            handled_bridge_request_ids: Vec::new(),
-            pending_companion_invites: Vec::new(),
+            discord,
             new_allowed_requester_id: String::new(),
         };
 
@@ -256,16 +233,7 @@ impl AlarmApp {
         for event in events {
             match event {
                 MonitorEvent::Snapshot(snapshot) => {
-                    if snapshot.applied_alarm_revision < self.alarm_revision {
-                        // Detection can update while the worker catches up with local alarm edits.
-                        self.snapshot.game_status = snapshot.game_status;
-                        self.snapshot.last_checked = snapshot.last_checked;
-                        continue;
-                    }
-                    let alarms_changed = self.snapshot.alarm.alarms != snapshot.alarm.alarms;
-                    self.snapshot = snapshot;
-
-                    if alarms_changed {
+                    if self.alarms.apply_snapshot(snapshot) {
                         self.persist_current_state();
                     }
                 }
@@ -276,10 +244,7 @@ impl AlarmApp {
                     fired_at,
                     sound,
                 } => {
-                    self.snapshot.alarm.alarms.retain(|alarm| alarm.id != id);
-                    self.snapshot.alarm.fired_at = Some(fired_at);
-                    self.snapshot.alarm.last_fired_label = Some(label.clone());
-                    refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+                    self.alarms.record_fired(id, label.clone(), fired_at);
 
                     let suffix = if delayed_by_game {
                         " after the game ended"
@@ -460,8 +425,10 @@ impl AlarmApp {
         if !self.state_writes_enabled {
             return false;
         }
+        // The persisted field is a serialization snapshot; the session owns live Discord state.
+        self.state.discord_bridge = self.discord.settings().clone();
         self.state.logs = persisted_log_entries_from_logs(&self.logs);
-        self.state.alarms = self.snapshot.alarm.alarms.clone();
+        self.state.alarms = self.alarms.snapshot().alarm.alarms.clone();
 
         match storage::save_state_to_path(&self.state, &self.state_path) {
             Ok(()) => true,
@@ -525,34 +492,9 @@ impl AlarmApp {
             self.state.delay_for_games,
             sound_path_from_text(&self.state.sound_path),
         );
-        let id = self.next_alarm_id;
-        self.next_alarm_id = self.next_alarm_id.saturating_add(1);
-        self.snapshot.alarm.alarms.push(PendingAlarmSnapshot {
-            id,
-            alarm: alarm.clone(),
-            status: AlarmStatus::Scheduled,
-            delayed_by_game: false,
-        });
-        sort_alarm_snapshots(&mut self.snapshot.alarm.alarms);
-        self.snapshot.alarm.fired_at = None;
-        self.snapshot.alarm.last_fired_label = None;
-        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
-
-        let revision = self.next_alarm_revision();
-        self.monitor.send(MonitorCommand::Schedule {
-            id,
-            alarm,
-            revision,
-        });
+        let command = self.alarms.schedule(alarm);
+        self.monitor.send(command);
         Ok(scheduled_for)
-    }
-
-    fn next_alarm_revision(&mut self) -> u64 {
-        self.alarm_revision = self
-            .alarm_revision
-            .checked_add(1)
-            .expect("a single app session cannot exhaust u64 alarm revisions");
-        self.alarm_revision
     }
 
     fn save_settings(&mut self) -> bool {
@@ -565,21 +507,14 @@ impl AlarmApp {
     }
 
     fn cancel_alarm(&mut self, id: AlarmId, label: &str) {
-        let revision = self.next_alarm_revision();
-        self.monitor
-            .send(MonitorCommand::CancelAlarm { id, revision });
-        self.snapshot.alarm.alarms.retain(|alarm| alarm.id != id);
-        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+        let command = self.alarms.cancel(id);
+        self.monitor.send(command);
         self.notify_info(format!("Alarm cancelled: {label}"));
     }
 
     fn cancel_all_alarms(&mut self) {
-        let revision = self.next_alarm_revision();
-        self.monitor.send(MonitorCommand::Cancel { revision });
-        self.snapshot.alarm.alarms.clear();
-        self.snapshot.alarm.fired_at = None;
-        self.snapshot.alarm.last_fired_label = None;
-        refresh_alarm_snapshot_status(&mut self.snapshot.alarm);
+        let command = self.alarms.cancel_all();
+        self.monitor.send(command);
         self.notify_info("All alarms cancelled");
     }
 
@@ -611,471 +546,54 @@ impl AlarmApp {
         }
     }
 
-    fn start_bridge_pairing(&mut self) {
-        if self.bridge_registration.is_some() {
-            self.set_bridge_status("Pairing registration already in progress");
-            self.show_app_notice(LogLevel::Info, "Pairing registration already in progress");
-            return;
-        }
-
-        if self
-            .state
-            .discord_bridge
-            .paired_discord_user_id
-            .as_deref()
-            .is_some_and(|user_id| !user_id.trim().is_empty())
-        {
-            self.set_bridge_status("Clear pairing before generating a new code");
-            self.show_app_notice(
-                LogLevel::Error,
-                "Clear pairing before generating a new code",
-            );
-            return;
-        }
-
-        if self.state.discord_bridge.bridge_url.trim().is_empty() {
-            self.notify_error("Discord bridge URL is blank");
-            return;
-        }
-
-        if discord_bridge::ensure_credentials(&mut self.state.discord_bridge) {
+    fn apply_discord_changes(&mut self, ctx: &egui::Context) -> bool {
+        let changes = self.discord.take_changes();
+        if changes.persist {
             self.persist_current_state();
         }
-
-        let pairing_code = discord_bridge::generate_pairing_code();
-        self.state.discord_bridge.pairing_code = pairing_code.clone();
-        self.state.discord_bridge.pairing_expires_at = None;
-        self.state.discord_bridge.poll_enabled = true;
-        self.persist_current_state();
-
-        let config = match self.state.discord_bridge.client_config() {
-            Ok(config) => config,
-            Err(error) => {
-                self.notify_error(format!("Discord bridge is not ready: {error}"));
-                return;
-            }
-        };
-        let (sender, receiver) = mpsc::channel();
-
-        thread::spawn(move || {
-            let result = discord_bridge::register_pairing(&config, &pairing_code)
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-        });
-
-        self.bridge_registration = Some(receiver);
-        self.set_bridge_status("Registering pairing code");
-        self.show_app_notice(LogLevel::Info, "Generating pairing code");
-    }
-
-    fn clear_bridge_pairing(&mut self) {
-        self.invalidate_bridge_tasks();
-        self.state.discord_bridge.companion_id.clear();
-        self.state.discord_bridge.api_token.clear();
-        self.state.discord_bridge.pairing_code.clear();
-        self.state.discord_bridge.pairing_expires_at = None;
-        self.state.discord_bridge.paired_discord_user_id = None;
-        self.state.discord_bridge.paired_discord_user_label = None;
-        self.state.discord_bridge.allowed_requester_ids.clear();
-        self.state.discord_bridge.allowed_requesters.clear();
-        self.state.discord_bridge.poll_enabled = false;
-        self.handled_bridge_request_ids.clear();
-        self.pending_companion_invites.clear();
-        self.persist_current_state();
-        self.set_bridge_status("Disconnected");
-        self.notify_info("Discord pairing cleared");
-    }
-
-    fn invalidate_bridge_tasks(&mut self) {
-        self.bridge_registration = None;
-        self.bridge_poll = None;
-    }
-
-    fn clear_inactive_bridge_pairing_code(&mut self) -> bool {
-        if self.bridge_registration.is_some() {
-            return false;
-        }
-
-        if clear_inactive_pairing_code(&mut self.state.discord_bridge, Local::now()) {
-            self.persist_current_state();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn drain_bridge_tasks(&mut self, ctx: &egui::Context) -> bool {
-        let mut changed = false;
-
-        let registration_result =
-            self.bridge_registration
-                .as_ref()
-                .and_then(|receiver| match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        Some(Err("Pairing registration worker stopped".to_owned()))
-                    }
-                });
-
-        if let Some(result) = registration_result {
-            self.bridge_registration = None;
-            changed = true;
-
-            match result {
-                Ok(response) => {
-                    self.state.discord_bridge.pairing_code = response.pairing_code;
-                    self.state.discord_bridge.pairing_expires_at =
-                        local_datetime_from_unix(response.expires_at_unix);
-                    self.persist_current_state();
-                    self.notify_info("Discord pairing code registered");
-                    self.set_bridge_status("Waiting for /companion pair");
-                    self.next_bridge_poll_at = Instant::now();
-                }
-                Err(error) => {
-                    self.state.discord_bridge.pairing_code.clear();
-                    self.state.discord_bridge.pairing_expires_at = None;
-                    self.persist_current_state();
-                    self.notify_error(format!("Could not register Discord pairing code: {error}"));
-                    self.set_bridge_status("Pairing failed");
-                }
+        self.discord.start_pending_tasks();
+        for message in changes.messages {
+            match message.kind {
+                MessageKind::NotifyInfo => self.notify_info(message.text),
+                MessageKind::NotifyError => self.notify_error(message.text),
+                MessageKind::NoticeInfo => self.show_app_notice(LogLevel::Info, message.text),
+                MessageKind::NoticeError => self.show_app_notice(LogLevel::Error, message.text),
+                MessageKind::LogInfo => self.log_info(message.text),
+                MessageKind::LogError => self.log_error(message.text),
             }
         }
-
-        let poll_result =
-            self.bridge_poll
-                .as_ref()
-                .and_then(|receiver| match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        Some(Err("Discord bridge polling worker stopped".to_owned()))
-                    }
-                });
-
-        if let Some(result) = poll_result {
-            self.bridge_poll = None;
-            changed = true;
-
-            match result {
-                Ok(response) => {
-                    self.process_bridge_poll_response(response, ctx);
-                }
-                Err(error) => {
-                    self.set_bridge_status(format!("Bridge poll failed: {error}"));
-                }
-            }
-        }
-
-        changed
-    }
-
-    fn maybe_start_bridge_poll(&mut self) {
-        if !self.state.discord_bridge.can_poll()
-            || self.bridge_poll.is_some()
-            || self.bridge_registration.is_some()
-            || Instant::now() < self.next_bridge_poll_at
-        {
-            return;
-        }
-
-        let config = match self.state.discord_bridge.client_config() {
-            Ok(config) => config,
-            Err(error) => {
-                self.set_bridge_status(format!("Discord bridge is not ready: {error}"));
-                return;
-            }
-        };
-        let (sender, receiver) = mpsc::channel();
-
-        self.next_bridge_poll_at = Instant::now() + discord_bridge::POLL_INTERVAL;
-        thread::spawn(move || {
-            let result = discord_bridge::poll_requests(&config).map_err(|error| error.to_string());
-            let _ = sender.send(result);
-        });
-
-        self.bridge_poll = Some(receiver);
-    }
-
-    fn process_bridge_poll_response(
-        &mut self,
-        response: PollRequestsResponse,
-        ctx: &egui::Context,
-    ) {
-        if !response.paired {
-            self.state.discord_bridge.paired_discord_user_id = None;
-            self.state.discord_bridge.paired_discord_user_label = None;
-            self.pending_companion_invites.clear();
-            self.persist_current_state();
-            self.set_bridge_status("Waiting for /companion pair");
-            return;
-        }
-
-        let mut bridge_settings_changed = false;
-
-        if self.state.discord_bridge.paired_discord_user_id != response.paired_discord_user_id
-            || self.state.discord_bridge.paired_discord_user_label
-                != response.paired_discord_user_label
-        {
-            self.state.discord_bridge.paired_discord_user_id = response.paired_discord_user_id;
-            self.state.discord_bridge.paired_discord_user_label =
-                response.paired_discord_user_label;
-            bridge_settings_changed = true;
-        }
-
-        if clear_inactive_pairing_code(&mut self.state.discord_bridge, Local::now()) {
-            bridge_settings_changed = true;
-        }
-
-        if bridge_settings_changed {
-            self.persist_current_state();
-        }
-
-        let request_count = response.requests.len();
-        for request in response.requests {
-            self.process_remote_discord_alarm_request(request);
-        }
-
-        let new_invite_labels =
-            new_companion_invite_labels(&self.pending_companion_invites, &response.invites);
-        self.pending_companion_invites = response.invites;
-        let invite_count = self.pending_companion_invites.len();
-
-        if !new_invite_labels.is_empty() {
+        if !changes.new_invite_labels.is_empty() {
             self.current_page = AppPage::Discord;
             request_alarm_attention(ctx);
             self.log_info(format!(
                 "Pending Discord access invite: {}",
-                new_invite_labels.join(", ")
+                changes.new_invite_labels.join(", ")
             ));
         }
-
-        if request_count == 0 && invite_count == 0 {
-            self.set_bridge_status("Connected");
-        } else {
-            self.set_bridge_status(format!(
-                "Connected; processed {request_count} request(s), {invite_count} invite(s) pending"
-            ));
-        }
+        changes.repaint
     }
 
-    fn process_remote_discord_alarm_request(&mut self, request: RemoteDiscordAlarmRequest) {
-        if self.handled_bridge_request_ids.contains(&request.id) {
-            self.report_bridge_request_status(
-                request.id,
-                RequestStatus::Accepted,
-                Some("already handled".to_owned()),
-            );
-            return;
+    fn update_discord(&mut self, ctx: &egui::Context) -> bool {
+        self.discord.advance(SessionTime::now());
+        let mut changed = self.apply_discord_changes(ctx);
+        while let Some(request) = self.discord.next_alarm_request(Instant::now()) {
+            changed |= self.apply_discord_changes(ctx);
+            let result = self
+                .schedule_alarm_from_values(
+                    alarm_label_from_text(request.label()),
+                    request.time_text(),
+                )
+                .map_err(|error| error.to_string());
+            self.discord.finish_alarm_request(request, result);
+            changed |= self.apply_discord_changes(ctx);
         }
-
-        let Some(owner_discord_user_id) = self
-            .state
-            .discord_bridge
-            .paired_discord_user_id
-            .as_deref()
-            .map(str::to_owned)
-        else {
-            self.reject_remote_discord_alarm_request(request.id, "companion is not paired");
-            return;
-        };
-
-        if request.target_id != owner_discord_user_id {
-            self.reject_remote_discord_alarm_request(request.id, "target Discord user mismatch");
-            return;
-        }
-
-        if !discord_bridge::requester_is_allowed(
-            &owner_discord_user_id,
-            &self.state.discord_bridge.allowed_requester_ids,
-            &request.requester_id,
-        ) {
-            self.reject_remote_discord_alarm_request(request.id, "requester is not allowed");
-            self.log_error(format!(
-                "Rejected Discord alarm request #{} from {}",
-                request.id, request.requester_id
-            ));
-            return;
-        }
-
-        if remember_requester_label_from_request(&mut self.state.discord_bridge, &request) {
-            self.persist_current_state();
-        }
-
-        match self
-            .schedule_alarm_from_values(alarm_label_from_text(&request.label), request.time_text())
-        {
-            Ok(scheduled_for) => {
-                self.remember_bridge_request_id(request.id);
-                self.report_bridge_request_status(request.id, RequestStatus::Accepted, None);
-                self.log_info(format!(
-                    "Accepted Discord alarm request #{} for {}",
-                    request.id,
-                    format_datetime(scheduled_for)
-                ));
-            }
-            Err(error) => {
-                self.reject_remote_discord_alarm_request(request.id, &error.to_string());
-            }
-        }
-    }
-
-    fn reject_remote_discord_alarm_request(&self, request_id: u64, reason: &str) {
-        self.report_bridge_request_status(
-            request_id,
-            RequestStatus::Rejected,
-            Some(reason.to_owned()),
-        );
-    }
-
-    fn report_bridge_request_status(
-        &self,
-        request_id: u64,
-        status: RequestStatus,
-        reason: Option<String>,
-    ) {
-        let Ok(config) = self.state.discord_bridge.client_config() else {
-            return;
-        };
-
-        thread::spawn(move || {
-            let _ = discord_bridge::report_request_status(
-                &config,
-                request_id,
-                status,
-                reason.as_deref(),
-            );
-        });
-    }
-
-    fn allow_companion_invite(&mut self, invite_id: u64) {
-        let Some(invite) = self
-            .pending_companion_invites
-            .iter()
-            .find(|invite| invite.id == invite_id)
-            .cloned()
-        else {
-            return;
-        };
-
-        self.state.discord_bridge.allowed_requester_ids = discord_bridge::add_allowed_requester(
-            &self.state.discord_bridge.allowed_requester_ids,
-            &invite.invitee_id,
-        );
-        discord_bridge::remember_allowed_requester(
-            &mut self.state.discord_bridge,
-            &invite.invitee_id,
-            &invite.invitee_label,
-        );
-        self.pending_companion_invites
-            .retain(|invite| invite.id != invite_id);
-        self.persist_current_state();
-        self.report_bridge_invite_status(invite_id, InviteStatus::Allowed);
-        self.notify_info(format!(
-            "Allowed {} to request alarms",
-            discord_invite_user_label(&invite)
-        ));
-    }
-
-    fn reject_companion_invite(&mut self, invite_id: u64) {
-        let Some(invite) = self
-            .pending_companion_invites
-            .iter()
-            .find(|invite| invite.id == invite_id)
-            .cloned()
-        else {
-            return;
-        };
-
-        self.pending_companion_invites
-            .retain(|invite| invite.id != invite_id);
-        self.report_bridge_invite_status(invite_id, InviteStatus::Rejected);
-        self.notify_info(format!(
-            "Rejected Discord access invite for {}",
-            discord_invite_user_label(&invite)
-        ));
-    }
-
-    fn report_bridge_invite_status(&self, invite_id: u64, status: InviteStatus) {
-        let Ok(config) = self.state.discord_bridge.client_config() else {
-            return;
-        };
-
-        thread::spawn(move || {
-            let _ = discord_bridge::report_invite_status(&config, invite_id, status);
-        });
-    }
-
-    fn add_allowed_requester_from_input(&mut self) {
-        let input = self.new_allowed_requester_id.trim().to_owned();
-
-        if input.is_empty() {
-            self.notify_error("Enter a Discord user ID before clicking Add");
-            return;
-        }
-
-        let Some(added_id) = discord_bridge::normalize_allowed_requester_id(&input) else {
-            self.notify_error(
-                "Could not add that Discord user. Use a numeric Discord ID or copied @mention; usernames alone do not work here.",
-            );
-            return;
-        };
-
-        let previous_ids =
-            discord_bridge::allowed_requester_ids(&self.state.discord_bridge.allowed_requester_ids);
-        if previous_ids.iter().any(|id| id == &added_id) {
-            self.notify_info(format!("Discord user {added_id} is already allowed"));
-            return;
-        }
-
-        self.state.discord_bridge.allowed_requester_ids = discord_bridge::add_allowed_requester(
-            &self.state.discord_bridge.allowed_requester_ids,
-            &added_id,
-        );
-        discord_bridge::remember_allowed_requester(&mut self.state.discord_bridge, &added_id, "");
-        self.new_allowed_requester_id.clear();
-        self.persist_current_state();
-        self.notify_info(format!("Allowed Discord user {added_id} to request alarms"));
-    }
-
-    fn remove_allowed_requester(&mut self, user_id: &str) {
-        self.state.discord_bridge.allowed_requester_ids = discord_bridge::remove_allowed_requester(
-            &self.state.discord_bridge.allowed_requester_ids,
-            user_id,
-        );
-        discord_bridge::forget_allowed_requester(&mut self.state.discord_bridge, user_id);
-        self.persist_current_state();
-        self.notify_info(format!("Removed Discord user {user_id} from allowed users"));
-    }
-
-    fn remember_bridge_request_id(&mut self, request_id: u64) {
-        if self.handled_bridge_request_ids.contains(&request_id) {
-            return;
-        }
-
-        self.handled_bridge_request_ids.push(request_id);
-
-        if self.handled_bridge_request_ids.len() > 500 {
-            let overflow_count = self.handled_bridge_request_ids.len() - 500;
-            self.handled_bridge_request_ids.drain(..overflow_count);
-        }
-    }
-
-    fn set_bridge_status(&mut self, status: impl Into<String>) -> bool {
-        let status = status.into();
-
-        if self.bridge_status == status {
-            false
-        } else {
-            self.bridge_status = status;
-            true
-        }
+        changed | self.apply_discord_changes(ctx)
     }
 
     fn alarm_summary(&self) -> String {
-        let alarm_count = self.snapshot.alarm.alarms.len();
+        let alarm_count = self.alarms.snapshot().alarm.alarms.len();
 
-        if let Some(next_alarm) = self.snapshot.alarm.alarms.first() {
+        if let Some(next_alarm) = self.alarms.snapshot().alarm.alarms.first() {
             let next_alarm_text = format!(
                 "{} at {}",
                 next_alarm.alarm.label,
@@ -1087,8 +605,8 @@ impl AlarmApp {
             } else {
                 format!("{alarm_count} alarms scheduled, next: {next_alarm_text}")
             }
-        } else if let Some(fired_at) = self.snapshot.alarm.fired_at {
-            match &self.snapshot.alarm.last_fired_label {
+        } else if let Some(fired_at) = self.alarms.snapshot().alarm.fired_at {
+            match &self.alarms.snapshot().alarm.last_fired_label {
                 Some(label) => {
                     format!("Last fired at {}: {label}", format_datetime(fired_at))
                 }
@@ -1100,7 +618,7 @@ impl AlarmApp {
     }
 
     fn draw_alarm_list(&mut self, ui: &mut egui::Ui) {
-        let alarms = self.snapshot.alarm.alarms.clone();
+        let alarms = self.alarms.snapshot().alarm.alarms.clone();
 
         ui.separator();
         ui.heading("Scheduled Alarms");
@@ -1138,19 +656,19 @@ impl AlarmApp {
     }
 
     fn alarm_status_label(&self) -> &'static str {
-        match self.snapshot.alarm.status {
+        match self.alarms.snapshot().alarm.status {
             AlarmStatus::Idle
             | AlarmStatus::Scheduled
             | AlarmStatus::WaitingForGameEnd
-            | AlarmStatus::Fired => self.snapshot.alarm.status.as_str(),
+            | AlarmStatus::Fired => self.alarms.snapshot().alarm.status.as_str(),
         }
     }
 
     fn draw_navigation(&mut self, ui: &mut egui::Ui) {
-        let discord_label = if self.pending_companion_invites.is_empty() {
+        let discord_label = if self.discord.pending_invites().is_empty() {
             "Discord".to_owned()
         } else {
-            format!("Discord ({})", self.pending_companion_invites.len())
+            format!("Discord ({})", self.discord.pending_invites().len())
         };
 
         ui.horizontal(|ui| {
@@ -1163,7 +681,7 @@ impl AlarmApp {
     }
 
     fn draw_detected_games_summary(&mut self, ui: &mut egui::Ui) {
-        let statuses = self.snapshot.game_status.statuses.clone();
+        let statuses = self.alarms.snapshot().game_status.statuses.clone();
 
         if statuses.is_empty() {
             ui.label("No game detectors configured");
@@ -1206,7 +724,7 @@ impl AlarmApp {
                 ui.end_row();
 
                 ui.label("Checked");
-                copyable_label(ui, format_datetime(self.snapshot.last_checked));
+                copyable_label(ui, format_datetime(self.alarms.snapshot().last_checked));
                 ui.end_row();
             });
     }
@@ -1407,6 +925,7 @@ impl AlarmApp {
 
         ui.separator();
         ui.heading("Bot Link");
+        let mut bridge_url = self.discord.settings().bridge_url.clone();
 
         ui.horizontal(|ui| {
             ui.label("Bridge URL");
@@ -1414,21 +933,20 @@ impl AlarmApp {
                 ui,
                 self.accent_color,
                 "discord_bridge_url",
-                &mut self.state.discord_bridge.bridge_url,
+                &mut bridge_url,
                 360.0,
                 "https://alarmbot.example.com",
             );
 
             if response.changed() {
-                self.invalidate_bridge_tasks();
-                self.pending_companion_invites.clear();
-                self.persist_current_state();
+                self.discord.set_bridge_url(bridge_url.clone());
+                self.apply_discord_changes(ui.ctx());
             }
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Status");
-            copyable_label(ui, self.bridge_status.clone());
+            copyable_label(ui, self.discord.status().to_owned());
         });
 
         ui.separator();
@@ -1436,16 +954,20 @@ impl AlarmApp {
 
         ui.horizontal(|ui| {
             if accent_button(ui, "Generate Pairing Code", self.accent_color).clicked() {
-                self.start_bridge_pairing();
+                self.discord.start_pairing();
+                self.apply_discord_changes(ui.ctx());
             }
 
             if accent_button(ui, "Clear Pairing", self.accent_color).clicked() {
-                self.clear_bridge_pairing();
+                self.discord.clear_pairing();
+                self.apply_discord_changes(ui.ctx());
             }
         });
 
-        if let Some(pairing_code) =
-            visible_pairing_code(&self.state.discord_bridge, Local::now()).map(str::to_owned)
+        if let Some(pairing_code) = self
+            .discord
+            .visible_pairing_code(Local::now())
+            .map(str::to_owned)
         {
             ui.horizontal(|ui| {
                 ui.label("Pairing code");
@@ -1453,12 +975,12 @@ impl AlarmApp {
 
                 if accent_button(ui, "Copy", self.accent_color).clicked() {
                     copy_to_clipboard(ui.ctx(), pairing_code.clone());
-                    self.show_app_notice(LogLevel::Info, "Pairing code copied to clipboard");
-                    self.set_bridge_status("Pairing code copied to clipboard");
+                    self.discord.pairing_code_copied();
+                    self.apply_discord_changes(ui.ctx());
                 }
             });
 
-            if let Some(expires_at) = self.state.discord_bridge.pairing_expires_at {
+            if let Some(expires_at) = self.discord.settings().pairing_expires_at {
                 copyable_label(
                     ui,
                     format!("Expires {}", format_expiry_datetime(expires_at)),
@@ -1468,7 +990,7 @@ impl AlarmApp {
 
         ui.horizontal(|ui| {
             ui.label("Paired account");
-            copyable_label(ui, paired_discord_account_label(&self.state.discord_bridge));
+            copyable_label(ui, paired_discord_account_label(self.discord.settings()));
         });
 
         self.draw_pending_companion_invites(ui);
@@ -1480,7 +1002,7 @@ impl AlarmApp {
     fn draw_allowed_discord_users(&mut self, ui: &mut egui::Ui) {
         ui.heading("Allowed Users");
 
-        let users = allowed_discord_user_rows(&self.state.discord_bridge);
+        let users = allowed_discord_user_rows(self.discord.settings());
         if users.is_empty() {
             ui.label("No extra allowed Discord users");
         } else {
@@ -1507,7 +1029,8 @@ impl AlarmApp {
                 });
 
             if let Some(user_id) = remove_user_id {
-                self.remove_allowed_requester(&user_id);
+                self.discord.remove_allowed_requester(&user_id);
+                self.apply_discord_changes(ui.ctx());
             }
         }
 
@@ -1532,14 +1055,20 @@ impl AlarmApp {
                     accent_button_with_min_height(ui, "Add", self.accent_color, input_height)
                         .clicked();
                 if add_clicked {
-                    self.add_allowed_requester_from_input();
+                    if self
+                        .discord
+                        .add_allowed_requester(&self.new_allowed_requester_id)
+                    {
+                        self.new_allowed_requester_id.clear();
+                    }
+                    self.apply_discord_changes(ui.ctx());
                 }
             });
         });
     }
 
     fn draw_pending_companion_invites(&mut self, ui: &mut egui::Ui) {
-        if self.pending_companion_invites.is_empty() {
+        if self.discord.pending_invites().is_empty() {
             return;
         }
 
@@ -1547,7 +1076,7 @@ impl AlarmApp {
         ui.heading("Pending Access Invites");
 
         let mut decision = None;
-        for invite in &self.pending_companion_invites {
+        for invite in self.discord.pending_invites() {
             ui.group(|ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
@@ -1579,9 +1108,10 @@ impl AlarmApp {
 
         if let Some((invite_id, status)) = decision {
             match status {
-                InviteStatus::Allowed => self.allow_companion_invite(invite_id),
-                InviteStatus::Rejected => self.reject_companion_invite(invite_id),
+                InviteStatus::Allowed => self.discord.allow_invite(invite_id),
+                InviteStatus::Rejected => self.discord.reject_invite(invite_id),
             }
+            self.apply_discord_changes(ui.ctx());
         }
     }
 
@@ -1789,7 +1319,8 @@ impl AlarmApp {
     }
 
     fn game_status(&self, game: &'static str) -> Option<&GameStatus> {
-        self.snapshot
+        self.alarms
+            .snapshot()
             .game_status
             .statuses
             .iter()
@@ -2017,10 +1548,8 @@ impl eframe::App for AlarmApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let state_changed = self.drain_monitor_events(ctx)
             | self.clear_finished_test_sound()
-            | self.clear_inactive_bridge_pairing_code()
-            | self.drain_bridge_tasks(ctx)
+            | self.update_discord(ctx)
             | self.clear_expired_app_notices();
-        self.maybe_start_bridge_poll();
 
         if state_changed {
             ctx.request_repaint();
@@ -2032,10 +1561,8 @@ impl eframe::App for AlarmApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let state_changed = self.drain_monitor_events(ui.ctx())
             | self.clear_finished_test_sound()
-            | self.clear_inactive_bridge_pairing_code()
-            | self.drain_bridge_tasks(ui.ctx())
+            | self.update_discord(ui.ctx())
             | self.clear_expired_app_notices();
-        self.maybe_start_bridge_poll();
 
         if state_changed {
             ui.ctx().request_repaint();
@@ -2123,46 +1650,6 @@ fn persisted_log_entries_from_logs(logs: &[LogEntry]) -> Vec<PersistedLogEntry> 
         .into_iter()
         .rev()
         .collect()
-}
-
-fn split_saved_alarms(
-    alarms: Vec<PendingAlarmSnapshot>,
-    now: DateTime<Local>,
-) -> (Vec<PendingAlarmSnapshot>, Vec<PendingAlarmSnapshot>) {
-    let (mut restored, mut missed): (Vec<_>, Vec<_>) = alarms
-        .into_iter()
-        .partition(|alarm| alarm.alarm.scheduled_for > now);
-
-    restored.retain(|alarm| alarm.status != AlarmStatus::Fired);
-    sort_alarm_snapshots(&mut restored);
-    sort_alarm_snapshots(&mut missed);
-
-    (restored, missed)
-}
-
-fn sort_alarm_snapshots(alarms: &mut [PendingAlarmSnapshot]) {
-    alarms.sort_by(|left, right| {
-        left.alarm
-            .scheduled_for
-            .cmp(&right.alarm.scheduled_for)
-            .then(left.id.cmp(&right.id))
-    });
-}
-
-fn refresh_alarm_snapshot_status(snapshot: &mut AlarmSnapshot) {
-    snapshot.status = if snapshot
-        .alarms
-        .iter()
-        .any(|alarm| alarm.status == AlarmStatus::WaitingForGameEnd)
-    {
-        AlarmStatus::WaitingForGameEnd
-    } else if !snapshot.alarms.is_empty() {
-        AlarmStatus::Scheduled
-    } else if snapshot.fired_at.is_some() {
-        AlarmStatus::Fired
-    } else {
-        AlarmStatus::Idle
-    };
 }
 
 impl From<PersistedLogLevel> for LogLevel {
@@ -2907,87 +2394,6 @@ fn paired_discord_account_label(settings: &DiscordBridgeSettings) -> String {
     }
 }
 
-fn visible_pairing_code(settings: &DiscordBridgeSettings, now: DateTime<Local>) -> Option<&str> {
-    let pairing_code = settings.pairing_code.trim();
-
-    if pairing_code.is_empty()
-        || settings
-            .paired_discord_user_id
-            .as_deref()
-            .is_some_and(|user_id| !user_id.trim().is_empty())
-        || match settings.pairing_expires_at {
-            Some(expires_at) => expires_at <= now,
-            None => true,
-        }
-    {
-        None
-    } else {
-        Some(pairing_code)
-    }
-}
-
-fn clear_inactive_pairing_code(settings: &mut DiscordBridgeSettings, now: DateTime<Local>) -> bool {
-    if settings.pairing_code.trim().is_empty() && settings.pairing_expires_at.is_none() {
-        return false;
-    }
-
-    if visible_pairing_code(settings, now).is_some() {
-        return false;
-    }
-
-    settings.pairing_code.clear();
-    settings.pairing_expires_at = None;
-    true
-}
-
-fn discord_user_label(user_id: &str) -> String {
-    format!("<@{user_id}>")
-}
-
-fn discord_invite_user_label(invite: &CompanionInvite) -> String {
-    let label = invite.invitee_label.trim();
-
-    if label.is_empty() {
-        discord_user_label(&invite.invitee_id)
-    } else {
-        label.to_owned()
-    }
-}
-
-fn new_companion_invite_labels(
-    existing_invites: &[CompanionInvite],
-    incoming_invites: &[CompanionInvite],
-) -> Vec<String> {
-    incoming_invites
-        .iter()
-        .filter(|incoming_invite| {
-            !existing_invites
-                .iter()
-                .any(|existing_invite| existing_invite.id == incoming_invite.id)
-        })
-        .map(discord_invite_user_label)
-        .collect()
-}
-
-fn remember_requester_label_from_request(
-    settings: &mut DiscordBridgeSettings,
-    request: &RemoteDiscordAlarmRequest,
-) -> bool {
-    let Some(display_name) = request
-        .requester_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|display_name| !display_name.is_empty())
-    else {
-        return false;
-    };
-
-    let previous_requesters = settings.allowed_requesters.clone();
-    discord_bridge::remember_allowed_requester(settings, &request.requester_id, display_name);
-
-    settings.allowed_requesters != previous_requesters
-}
-
 fn allowed_discord_user_rows(settings: &DiscordBridgeSettings) -> Vec<AllowedDiscordUserRow> {
     discord_bridge::allowed_requester_ids(&settings.allowed_requester_ids)
         .into_iter()
@@ -3009,10 +2415,6 @@ fn allowed_discord_user_rows(settings: &DiscordBridgeSettings) -> Vec<AllowedDis
         .collect()
 }
 
-fn local_datetime_from_unix(timestamp: i64) -> Option<DateTime<Local>> {
-    DateTime::<Utc>::from_timestamp(timestamp, 0).map(|value| value.with_timezone(&Local))
-}
-
 fn alarm_label_from_text(value: &str) -> String {
     let trimmed = value.trim();
 
@@ -3027,6 +2429,7 @@ fn alarm_label_from_text(value: &str) -> String {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::mpsc;
 
     fn test_state_path() -> PathBuf {
         std::env::temp_dir()
@@ -3035,9 +2438,20 @@ mod tests {
     }
 
     fn test_app(path: PathBuf) -> (AlarmApp, mpsc::Sender<MonitorEvent>) {
-        let (monitor, events, _commands) = MonitorHandle::test_channels();
-        let app = AlarmApp::from_state_path(path, |_, _, _| monitor);
+        let (app, events, _commands) = test_app_with_commands(path);
         (app, events)
+    }
+
+    fn test_app_with_commands(
+        path: PathBuf,
+    ) -> (
+        AlarmApp,
+        mpsc::Sender<MonitorEvent>,
+        mpsc::Receiver<MonitorCommand>,
+    ) {
+        let (monitor, events, commands) = MonitorHandle::test_channels();
+        let app = AlarmApp::from_state_path(path, |_, _, _| monitor);
+        (app, events, commands)
     }
 
     fn schedule_test_alarm(app: &mut AlarmApp) {
@@ -3071,7 +2485,7 @@ mod tests {
     fn stale_snapshot_does_not_remove_a_new_alarm() {
         let path = test_state_path();
         let (mut app, events) = test_app(path.clone());
-        let mut stale = app.snapshot.clone();
+        let mut stale = app.alarms.snapshot().clone();
         stale
             .game_status
             .statuses
@@ -3084,12 +2498,12 @@ mod tests {
         app.drain_monitor_events(&egui::Context::default());
 
         assert_eq!(
-            app.snapshot.alarm.alarms.len(),
+            app.alarms.snapshot().alarm.alarms.len(),
             1,
             "new alarm must remain visible"
         );
         assert!(
-            app.snapshot.game_status.statuses[0].is_active(),
+            app.alarms.snapshot().game_status.statuses[0].is_active(),
             "game detection should still update"
         );
         assert_eq!(
@@ -3102,80 +2516,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_snapshot_does_not_restore_a_canceled_alarm() {
-        let path = test_state_path();
-        let (mut app, events) = test_app(path.clone());
-        schedule_test_alarm(&mut app);
-        let mut stale = app.snapshot.clone();
-        stale.applied_alarm_revision = app.alarm_revision;
-        let id = stale.alarm.alarms[0].id;
-        app.cancel_alarm(id, "Test alarm");
-
-        events
-            .send(MonitorEvent::Snapshot(stale))
-            .expect("UI should receive snapshot");
-        app.drain_monitor_events(&egui::Context::default());
-
-        assert!(
-            app.snapshot.alarm.alarms.is_empty(),
-            "canceled alarm must stay removed"
-        );
-        assert!(
-            storage::load_state_from_path(path)
-                .expect("saved state should load")
-                .alarms
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn stale_snapshot_does_not_undo_cancel_all() {
-        let (mut app, events) = test_app(test_state_path());
-        schedule_test_alarm(&mut app);
-        let mut stale = app.snapshot.clone();
-        stale.applied_alarm_revision = app.alarm_revision;
-        app.cancel_all_alarms();
-
-        events
-            .send(MonitorEvent::Snapshot(stale))
-            .expect("UI should receive snapshot");
-        app.drain_monitor_events(&egui::Context::default());
-
-        assert!(
-            app.snapshot.alarm.alarms.is_empty(),
-            "Cancel All must remain applied"
-        );
-    }
-
-    #[test]
-    fn clearing_pairing_discards_a_queued_registration_result() {
-        let (mut app, _) = test_app(test_state_path());
-        let (sender, receiver) = mpsc::channel();
-        app.bridge_registration = Some(receiver);
-        sender
-            .send(Ok(PairingRegistrationResponse {
-                pairing_code: "OLD-CODE".to_owned(),
-                expires_at_unix: (Local::now() + chrono::Duration::minutes(5)).timestamp(),
-            }))
-            .expect("registration should be queued");
-
-        app.clear_bridge_pairing();
-        app.drain_bridge_tasks(&egui::Context::default());
-
-        assert!(
-            app.state.discord_bridge.pairing_code.is_empty(),
-            "old code must not return"
-        );
-        assert!(app.bridge_registration.is_none());
-    }
-
-    #[test]
     fn acknowledged_snapshot_updates_and_saves_alarm_status() {
         let path = test_state_path();
-        let (mut app, events) = test_app(path.clone());
+        let (mut app, events, commands) = test_app_with_commands(path.clone());
         schedule_test_alarm(&mut app);
-        let mut acknowledged = app.snapshot.clone();
-        acknowledged.applied_alarm_revision = app.alarm_revision;
+        let mut acknowledged = app.alarms.snapshot().clone();
+        let MonitorCommand::Schedule { revision, .. } = commands.recv().unwrap() else {
+            panic!("scheduling should send an alarm edit command");
+        };
+        acknowledged.applied_alarm_revision = revision;
         acknowledged.alarm.status = AlarmStatus::WaitingForGameEnd;
         acknowledged.alarm.alarms[0].status = AlarmStatus::WaitingForGameEnd;
         acknowledged.alarm.alarms[0].delayed_by_game = true;
@@ -3185,7 +2534,10 @@ mod tests {
             .expect("UI should receive acknowledgement");
         app.drain_monitor_events(&egui::Context::default());
 
-        assert_eq!(app.snapshot.alarm.status, AlarmStatus::WaitingForGameEnd);
+        assert_eq!(
+            app.alarms.snapshot().alarm.status,
+            AlarmStatus::WaitingForGameEnd
+        );
         let saved = storage::load_state_from_path(path).expect("saved state should load");
         assert_eq!(saved.alarms[0].status, AlarmStatus::WaitingForGameEnd);
         assert!(saved.alarms[0].delayed_by_game);
@@ -3196,36 +2548,108 @@ mod tests {
         let path = test_state_path();
         let (mut app, _) = test_app(path.clone());
         schedule_test_alarm(&mut app);
-        let alarms = app.snapshot.alarm.alarms.clone();
+        let alarms = app.alarms.snapshot().alarm.alarms.clone();
         drop(app);
 
         let (restarted, _) = test_app(path);
 
-        assert_eq!(restarted.snapshot.alarm.alarms, alarms);
+        assert_eq!(restarted.alarms.snapshot().alarm.alarms, alarms);
     }
 
     #[test]
-    fn clearing_pairing_discards_a_queued_poll_result() {
-        let (mut app, _) = test_app(test_state_path());
-        let (sender, receiver) = mpsc::channel();
-        app.bridge_poll = Some(receiver);
-        sender
-            .send(Ok(PollRequestsResponse {
-                paired: true,
-                paired_discord_user_id: Some("old-owner".to_owned()),
-                paired_discord_user_label: None,
-                requests: Vec::new(),
-                invites: Vec::new(),
-            }))
-            .expect("poll result should be queued");
-
-        app.clear_bridge_pairing();
-        app.drain_bridge_tasks(&egui::Context::default());
-
-        assert!(
-            app.state.discord_bridge.paired_discord_user_id.is_none(),
-            "old owner must not return"
+    fn discord_session_settings_keep_the_existing_saved_shape_and_restore_on_restart() {
+        let path = test_state_path();
+        let (mut app, _) = test_app(path.clone());
+        let settings = DiscordBridgeSettings {
+            bridge_url: "https://bridge.invalid".to_owned(),
+            companion_id: "saved-companion".to_owned(),
+            api_token: "saved-token".to_owned(),
+            paired_discord_user_id: Some("111".to_owned()),
+            allowed_requester_ids: "222".to_owned(),
+            ..Default::default()
+        };
+        app.discord = DiscordSession::new(settings.clone());
+        assert!(app.persist_current_state());
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("saved state should be readable"),
+        )
+        .expect("saved state should be JSON");
+        assert_eq!(
+            saved["discord_bridge"],
+            serde_json::to_value(&settings).unwrap()
         );
+        let (restarted, _) = test_app(path);
+        assert_eq!(restarted.discord.settings(), &settings);
+    }
+
+    #[test]
+    fn discord_poll_schedules_once_and_accepts_even_when_saving_is_paused() {
+        use crate::discord_bridge::{PollRequestsResponse, RemoteAlarmRequest};
+        use chrono::Timelike;
+
+        for paused in [false, true] {
+            let path = test_state_path();
+            if paused {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "recoverable but invalid state").unwrap();
+            }
+            let (mut app, _) = test_app(path.clone());
+            let settings = DiscordBridgeSettings {
+                companion_id: "test-companion".to_owned(),
+                api_token: "test-token".to_owned(),
+                paired_discord_user_id: Some("111".to_owned()),
+                ..Default::default()
+            };
+            let due = Local::now() + chrono::Duration::hours(1);
+            let request = RemoteAlarmRequest {
+                id: 7,
+                requester_id: "111".to_owned(),
+                requester_label: None,
+                target_id: "111".to_owned(),
+                hour: due.hour() as u8,
+                minute: due.minute() as u8,
+                label: "   ".to_owned(),
+                created_at_unix: 1,
+                expires_at_unix: 2,
+            };
+            app.discord = crate::discord_session::tests::queued_poll(
+                settings,
+                PollRequestsResponse {
+                    paired: true,
+                    paired_discord_user_id: Some("111".to_owned()),
+                    paired_discord_user_label: None,
+                    requests: vec![request.clone(), request],
+                    invites: Vec::new(),
+                },
+            );
+            app.update_discord(&egui::Context::default());
+            assert_eq!(
+                app.alarms.snapshot().alarm.alarms.len(),
+                1,
+                "duplicate must not schedule twice"
+            );
+            assert_eq!(app.alarms.snapshot().alarm.alarms[0].alarm.label, "Alarm");
+            assert_eq!(
+                app.logs
+                    .iter()
+                    .filter(|entry| entry
+                        .message
+                        .starts_with("Accepted Discord alarm request #7 "))
+                    .count(),
+                1
+            );
+            if paused {
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "recoverable but invalid state"
+                );
+            } else {
+                assert_eq!(
+                    storage::load_state_from_path(&path).unwrap().alarms,
+                    app.alarms.snapshot().alarm.alarms
+                );
+            }
+        }
     }
 
     #[test]
@@ -3291,69 +2715,6 @@ mod tests {
     }
 
     #[test]
-    fn requester_label_from_remote_request_updates_allowed_user_row() {
-        let mut settings = DiscordBridgeSettings {
-            allowed_requester_ids: "222".to_owned(),
-            ..DiscordBridgeSettings::default()
-        };
-        let request = RemoteDiscordAlarmRequest {
-            id: 1,
-            requester_id: "222".to_owned(),
-            requester_label: Some("Jane".to_owned()),
-            target_id: "111".to_owned(),
-            hour: 7,
-            minute: 5,
-            label: "Laundry".to_owned(),
-            created_at_unix: 1,
-            expires_at_unix: 2,
-        };
-
-        assert!(remember_requester_label_from_request(
-            &mut settings,
-            &request
-        ));
-        assert_eq!(
-            allowed_discord_user_rows(&settings),
-            vec![AllowedDiscordUserRow {
-                discord_user_id: "222".to_owned(),
-                display_name: "Jane".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
-    fn blank_requester_label_does_not_overwrite_known_allowed_user_name() {
-        let mut settings = DiscordBridgeSettings {
-            allowed_requester_ids: "222".to_owned(),
-            ..DiscordBridgeSettings::default()
-        };
-        discord_bridge::remember_allowed_requester(&mut settings, "222", "Jane");
-        let request = RemoteDiscordAlarmRequest {
-            id: 1,
-            requester_id: "222".to_owned(),
-            requester_label: Some("   ".to_owned()),
-            target_id: "111".to_owned(),
-            hour: 7,
-            minute: 5,
-            label: "Laundry".to_owned(),
-            created_at_unix: 1,
-            expires_at_unix: 2,
-        };
-
-        assert!(!remember_requester_label_from_request(
-            &mut settings,
-            &request
-        ));
-        assert_eq!(
-            allowed_discord_user_rows(&settings),
-            vec![AllowedDiscordUserRow {
-                discord_user_id: "222".to_owned(),
-                display_name: "Jane".to_owned(),
-            }]
-        );
-    }
-
-    #[test]
     fn paired_discord_account_label_prefers_name_with_id() {
         let mut settings = DiscordBridgeSettings {
             paired_discord_user_id: Some("123".to_owned()),
@@ -3366,77 +2727,6 @@ mod tests {
         settings.paired_discord_user_label = None;
 
         assert_eq!(paired_discord_account_label(&settings), "ID: 123");
-    }
-
-    #[test]
-    fn pairing_code_is_only_visible_while_unpaired_and_unexpired() {
-        let now = Local.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
-        let mut settings = DiscordBridgeSettings {
-            pairing_code: "ABCD-1234".to_owned(),
-            pairing_expires_at: Some(now + chrono::Duration::minutes(5)),
-            ..Default::default()
-        };
-
-        assert_eq!(visible_pairing_code(&settings, now), Some("ABCD-1234"));
-
-        settings.paired_discord_user_id = Some("123".to_owned());
-        assert_eq!(visible_pairing_code(&settings, now), None);
-
-        settings.paired_discord_user_id = None;
-        settings.pairing_expires_at = Some(now - chrono::Duration::seconds(1));
-        assert_eq!(visible_pairing_code(&settings, now), None);
-    }
-
-    #[test]
-    fn inactive_pairing_code_is_cleared_from_state() {
-        let now = Local.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap();
-        let mut settings = DiscordBridgeSettings {
-            pairing_code: "ABCD-1234".to_owned(),
-            pairing_expires_at: Some(now + chrono::Duration::minutes(5)),
-            paired_discord_user_id: Some("123".to_owned()),
-            ..Default::default()
-        };
-
-        assert!(clear_inactive_pairing_code(&mut settings, now));
-        assert!(settings.pairing_code.is_empty());
-        assert_eq!(settings.pairing_expires_at, None);
-
-        assert!(!clear_inactive_pairing_code(&mut settings, now));
-    }
-
-    #[test]
-    fn new_companion_invite_labels_only_returns_unseen_invites() {
-        let existing = vec![CompanionInvite {
-            id: 1,
-            owner_id: "111".to_owned(),
-            invitee_id: "222".to_owned(),
-            invitee_label: "Jane".to_owned(),
-            created_at_unix: 1,
-            expires_at_unix: 2,
-        }];
-        let incoming = vec![
-            CompanionInvite {
-                id: 1,
-                owner_id: "111".to_owned(),
-                invitee_id: "222".to_owned(),
-                invitee_label: "Jane".to_owned(),
-                created_at_unix: 1,
-                expires_at_unix: 2,
-            },
-            CompanionInvite {
-                id: 2,
-                owner_id: "111".to_owned(),
-                invitee_id: "333".to_owned(),
-                invitee_label: String::new(),
-                created_at_unix: 3,
-                expires_at_unix: 4,
-            },
-        ];
-
-        assert_eq!(
-            new_companion_invite_labels(&existing, &incoming),
-            vec!["<@333>".to_owned()]
-        );
     }
 
     #[test]
@@ -3474,28 +2764,6 @@ mod tests {
                 Some("no recent GSI updates".to_owned())
             )
         )));
-    }
-
-    #[test]
-    fn saved_alarms_are_split_into_restored_and_missed() {
-        let now = Local::now();
-        let past = PendingAlarmSnapshot {
-            id: 1,
-            alarm: Alarm::new("Past", now - chrono::Duration::minutes(1), true),
-            status: AlarmStatus::Scheduled,
-            delayed_by_game: false,
-        };
-        let future = PendingAlarmSnapshot {
-            id: 2,
-            alarm: Alarm::new("Future", now + chrono::Duration::minutes(1), true),
-            status: AlarmStatus::Scheduled,
-            delayed_by_game: false,
-        };
-
-        let (restored, missed) = split_saved_alarms(vec![future.clone(), past.clone()], now);
-
-        assert_eq!(restored, vec![future]);
-        assert_eq!(missed, vec![past]);
     }
 
     #[test]

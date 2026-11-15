@@ -260,6 +260,7 @@ fn play_alarm_sound(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alarm_coordination::AlarmCoordination;
     use crate::notifier::tests::RecordingNotifier;
     use crate::sound::tests::RecordingSoundPlayer;
 
@@ -294,27 +295,20 @@ mod tests {
             }
         };
         let alarm = Alarm::new("Test", Local::now() + chrono::Duration::hours(1), false);
+        let (mut coordination, _) = AlarmCoordination::restore(Vec::new(), Local::now());
         commands
-            .send(MonitorCommand::Schedule {
-                id: 1,
-                alarm: alarm.clone(),
-                revision: 1,
-            })
+            .send(coordination.schedule(alarm.clone()))
             .expect("worker should accept scheduling");
         let scheduled = receive_snapshot(1);
         commands
-            .send(MonitorCommand::CancelAlarm { id: 1, revision: 2 })
+            .send(coordination.cancel(1))
             .expect("worker should accept cancellation");
         let canceled = receive_snapshot(2);
         commands
-            .send(MonitorCommand::Schedule {
-                id: 2,
-                alarm,
-                revision: 3,
-            })
+            .send(coordination.schedule(alarm))
             .expect("worker should accept another alarm");
         commands
-            .send(MonitorCommand::Cancel { revision: 4 })
+            .send(coordination.cancel_all())
             .expect("worker should accept Cancel All");
         let canceled_all = receive_snapshot(4);
         commands

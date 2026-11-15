@@ -1,10 +1,12 @@
 //! Desktop alarm application with game-aware scheduling and optional Discord requests.
 
 pub mod alarm;
+mod alarm_coordination;
 pub mod app;
 pub mod counter_strike;
 pub mod crash;
 pub mod discord_bridge;
+mod discord_session;
 pub mod game;
 pub mod league;
 pub mod notifier;

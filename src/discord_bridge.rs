@@ -528,6 +528,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn outbound_payloads_keep_the_shared_bridge_contract() {
+        assert_eq!(
+            serde_json::to_value(PairingRegistrationRequest {
+                companion_id: "companion",
+                api_token: "token",
+                pairing_code: "ABCD-1234",
+            })
+            .unwrap(),
+            serde_json::json!({"companion_id":"companion", "api_token":"token", "pairing_code":"ABCD-1234"}),
+        );
+        for (status, expected) in [
+            (RequestStatus::Accepted, "accepted"),
+            (RequestStatus::Rejected, "rejected"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(RequestStatusReport {
+                    status: status.as_str(),
+                    reason: None
+                })
+                .unwrap(),
+                serde_json::json!({"status":expected, "reason":null}),
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(RequestStatusReport {
+                status: RequestStatus::Rejected.as_str(),
+                reason: Some("requester is not allowed")
+            })
+            .unwrap(),
+            serde_json::json!({"status":"rejected", "reason":"requester is not allowed"}),
+        );
+        for (status, expected) in [
+            (InviteStatus::Allowed, "allowed"),
+            (InviteStatus::Rejected, "rejected"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(InviteStatusReport {
+                    status: status.as_str()
+                })
+                .unwrap(),
+                serde_json::json!({"status":expected}),
+            );
+        }
+    }
+
+    #[test]
     fn bridge_debug_redacts_secrets_without_changing_saved_credentials() {
         let settings = DiscordBridgeSettings {
             companion_id: "test-companion".to_owned(),
